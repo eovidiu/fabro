@@ -236,6 +236,31 @@ fn build_script(target: &str, zig_arch: &str) -> String {
          cargo install --locked --root /opt/cargo-tools cargo-zigbuild; \
          fi; \
          rustup target add {target}; \
+         git config --global --add safe.directory /src; \
          cargo zigbuild --locked --release -p fabro-cli --target {target}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DockerArch, build_script};
+
+    #[test]
+    fn build_script_configures_git_safe_directory_before_zigbuild_for_every_arch() {
+        for arch in [DockerArch::Amd64, DockerArch::Arm64] {
+            let script = build_script(arch.target(), arch.zig_arch());
+            let safe_directory_at = script
+                .find("git config --global --add safe.directory /src")
+                .unwrap_or_else(|| {
+                    panic!("{arch} build script is missing the git safe.directory config")
+                });
+            let zigbuild_at = script.find("cargo zigbuild").unwrap_or_else(|| {
+                panic!("{arch} build script is missing the cargo zigbuild invocation")
+            });
+            assert!(
+                safe_directory_at < zigbuild_at,
+                "{arch} build script must set git safe.directory before running cargo zigbuild"
+            );
+        }
+    }
 }

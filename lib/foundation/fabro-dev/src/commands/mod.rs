@@ -8,6 +8,7 @@ mod release;
 mod spa;
 mod spa_check;
 mod spa_refresh;
+mod stage_deploy;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -20,6 +21,7 @@ pub(crate) use docs::{DocsArgs, docs};
 use fabro_util::shell::shell_quote;
 pub(crate) use release::{ReleaseArgs, release};
 pub(crate) use spa::{SpaArgs, spa};
+pub(crate) use stage_deploy::{StageDeployArgs, stage_deploy};
 
 pub(crate) fn workspace_root() -> PathBuf {
     let mut root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();

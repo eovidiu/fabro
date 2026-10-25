@@ -2254,9 +2254,11 @@ dependencies = [
  "fabro-options-metadata",
  "fabro-util",
  "quick-xml 0.36.2",
+ "serde_json",
  "tempfile",
  "toml_edit",
  "tracing-subscriber",
+ "url",
  "walkdir",
 ]
 

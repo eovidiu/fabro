@@ -30,6 +30,8 @@ enum Command {
     Release(commands::ReleaseArgs),
     /// Manage embedded Fabro web SPA assets.
     Spa(commands::SpaArgs),
+    /// Move the fabro-stage Coolify app to a new stage image tag and verify it.
+    StageDeploy(commands::StageDeployArgs),
 }
 
 impl Command {
@@ -41,6 +43,7 @@ impl Command {
             Self::Docs(args) => commands::docs(args),
             Self::Release(args) => commands::release(args),
             Self::Spa(args) => commands::spa(args),
+            Self::StageDeploy(args) => commands::stage_deploy(&args),
         }
     }
 }
