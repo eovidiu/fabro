@@ -17,7 +17,9 @@ USER root
 
 ARG TARGETARCH
 
+# bash: the Local sandbox's sentinel execs bash to run agent commands.
 RUN apk add --no-cache \
+      bash \
       ca-certificates \
       git \
       su-exec \

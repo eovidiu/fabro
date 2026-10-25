@@ -897,7 +897,7 @@ fn scrub_and_truncate(body: &str, secrets: &[&str]) -> String {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "stage-deploy tests build fixture secret files, a stub docker binary, and read the checked-in workflow file synchronously"
+    reason = "stage-deploy tests build fixture secret files, a stub docker shell function, and read the checked-in workflow file synchronously"
 )]
 #[cfg(test)]
 mod tests {
@@ -1909,9 +1909,11 @@ mod tests {
         );
     }
 
-    // A manifest list as `docker buildx imagetools create` actually writes it
-    // (Go `json.MarshalIndent(&idx, "", "  ")`): keys use `"key": value`, with
-    // a space after the colon, unlike the compact form round 1's grep assumed.
+    // Real `docker buildx imagetools create` output (Go
+    // `json.MarshalIndent(&idx, "", "  ")`) puts a space after each key's
+    // colon (`"key": value`), which round 1's compact-JSON grep did not
+    // expect; this fixture's exact indentation width is for readability
+    // only, since the verify step parses it structurally with jq.
     const INDENTED_INDEX_BOTH_ARCHES: &str = r#"{
    "schemaVersion": 2,
    "mediaType": "application/vnd.oci.image.index.v1+json",

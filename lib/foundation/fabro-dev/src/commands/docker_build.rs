@@ -263,4 +263,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test reads the checked-in Dockerfile synchronously"
+    )]
+    fn runtime_image_installs_bash_for_the_local_sandbox() {
+        // sandbox-driver-host's sentinel (fence/sentinel.rs) execs bash for
+        // every Local-sandbox agent command; the runtime image must carry it.
+        let dockerfile_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../Dockerfile");
+        let contents = std::fs::read_to_string(dockerfile_path)
+            .unwrap_or_else(|error| panic!("reading {dockerfile_path}: {error}"));
+
+        let marker = "apk add --no-cache \\\n";
+        let at = contents
+            .find(marker)
+            .unwrap_or_else(|| panic!("Dockerfile has no 'apk add --no-cache' block"));
+        let after = &contents[at + marker.len()..];
+        let packages: Vec<&str> = after
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("&&"))
+            .map(|line| line.trim().trim_end_matches('\\').trim())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        assert!(
+            packages.contains(&"bash"),
+            "Dockerfile's apk add --no-cache list must include bash (the Local sandbox's sentinel execs bash); packages: {packages:?}"
+        );
+    }
 }
