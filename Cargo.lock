@@ -2342,6 +2342,7 @@ dependencies = [
  "anyhow",
  "fabro-dot",
  "graphviz-sys",
+ "quick-xml 0.38.4",
  "regex",
 ]
 

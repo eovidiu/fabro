@@ -2042,6 +2042,11 @@ fn slack_app_state_with_settings_and_secret_sources(
         shutdown: tokio_util::sync::CancellationToken::new(),
         worker_control_bus: None,
         worker_runtime: None,
+        graph_url_fetch_policy_override: None,
+        graph_url_render_limits_override: None,
+        graph_url_render_exe_override: None,
+        graph_url_validation_override: None,
+        graph_url_credential_override: None,
         automation_materializer_override: None,
     })
     .expect("slack test app state should build")
@@ -5030,6 +5035,11 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         shutdown: tokio_util::sync::CancellationToken::new(),
         worker_control_bus: None,
         worker_runtime: None,
+        graph_url_fetch_policy_override: None,
+        graph_url_render_limits_override: None,
+        graph_url_render_exe_override: None,
+        graph_url_validation_override: None,
+        graph_url_credential_override: None,
         automation_materializer_override: None,
     };
     build_app_state(config).expect("test app state should build")
@@ -8800,6 +8810,2125 @@ async fn render_graph_from_manifest_accepts_fabro_dotted_attributes() {
     );
 }
 
+fn graph_url_test_resolver(
+    hosts: Vec<(String, std::net::SocketAddr)>,
+) -> graph_url_fetch::Resolver {
+    Arc::new(move |host: String, port: u16| {
+        use std::net::ToSocketAddrs as _;
+
+        let hosts = hosts.clone();
+        Box::pin(async move {
+            if let Some((_, addr)) = hosts.iter().find(|(name, _)| *name == host) {
+                return Ok(vec![*addr]);
+            }
+            format!("{host}:{port}")
+                .to_socket_addrs()
+                .map(Iterator::collect)
+        })
+    })
+}
+
+fn graph_url_policy_with_hosts(
+    hosts: Vec<(&str, std::net::SocketAddr)>,
+) -> graph_url_fetch::FetchPolicy {
+    graph_url_fetch::FetchPolicy {
+        allow_insecure_loopback: true,
+        resolver:                graph_url_test_resolver(
+            hosts.into_iter().map(|(h, a)| (h.to_string(), a)).collect(),
+        ),
+        fetch_timeout:           std::time::Duration::from_secs(10),
+        max_redirects:           3,
+        max_body_bytes:          3 * 1024 * 1024,
+    }
+}
+
+fn graph_url_policy() -> graph_url_fetch::FetchPolicy {
+    graph_url_policy_with_hosts(Vec::new())
+}
+
+fn render_url_request(body: &serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(api("/graph/render-url"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(body).unwrap()))
+        .unwrap()
+}
+
+fn render_url_app(policy: graph_url_fetch::FetchPolicy) -> (Arc<AppState>, Router) {
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(policy)
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    (state, app)
+}
+
+/// No fetch-policy override: the production SSRF policy, exercised
+/// directly (every blocked case here refuses before any connection, so no
+/// mock server is needed).
+fn render_url_app_production() -> (Arc<AppState>, Router) {
+    let state = TestAppStateBuilder::new().build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    (state, app)
+}
+
+#[tokio::test]
+async fn render_url_returns_svg_for_a_valid_https_workflow() {
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    let svg = body["svg"].as_str().expect("svg should be a string");
+    assert!(svg.contains("<svg"), "expected svg markup, got: {svg}");
+    assert_eq!(body["notices"].as_array().unwrap().len(), 0);
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn render_url_reports_the_requested_direction() {
+    // Shared contract: the response's `direction` is the request's own
+    // when it sent one, regardless of the source's `rankdir` (or lack
+    // of one).
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro"), "direction": "lr" }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "lr");
+}
+
+#[tokio::test]
+async fn render_url_reports_the_sources_rankdir_when_none_was_requested() {
+    // Shared contract: no request `direction` falls back to the
+    // source's own `rankdir` when it is `lr`/`tb`.
+    const DOT: &str = r"digraph Demo {
+        rankdir=LR
+        start [shape=Mdiamond]
+        exit  [shape=Msquare]
+        start -> exit
+    }";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "lr");
+}
+
+#[tokio::test]
+async fn render_url_reports_tb_when_the_source_has_no_rankdir() {
+    // Shared contract: no request `direction` and no source `rankdir`
+    // falls back to `tb`, Graphviz's own layout default.
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "tb");
+}
+
+#[tokio::test]
+async fn render_url_omits_direction_when_the_sources_rankdir_is_bt() {
+    // Shared contract: `direction` cannot represent `bt`/`rl`, so it is
+    // omitted entirely rather than reporting something misleading.
+    const DOT: &str = r"digraph Demo {
+        rankdir=BT
+        start [shape=Mdiamond]
+        exit  [shape=Msquare]
+        start -> exit
+    }";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert!(body.get("direction").is_none(), "{body:?}");
+}
+
+#[tokio::test]
+async fn render_url_reports_tb_when_the_sources_rankdir_has_the_wrong_case() {
+    // MAJOR correctness fix: Graphviz recognizes `rankdir` values
+    // case-sensitively; `lr` (wrong case) draws the same `TB` layout as
+    // no `rankdir` at all, so the reported `direction` must match that
+    // drawing, not the literal (wrong-case) source text.
+    const DOT: &str = r"digraph Demo {
+        rankdir=lr
+        start [shape=Mdiamond]
+        exit  [shape=Msquare]
+        start -> exit
+    }";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "tb");
+}
+
+/// `(width, height)` parsed from an SVG's own `viewBox="minX minY width
+/// height"` attribute.
+fn viewbox_dims(svg: &str) -> (f64, f64) {
+    let needle = r#"viewBox=""#;
+    let start = svg.find(needle).expect("svg should have a viewBox") + needle.len();
+    let rest = &svg[start..];
+    let end = rest.find('"').expect("viewBox should be closed");
+    let mut parts = rest[..end].split_whitespace();
+    parts.next().expect("viewBox minX");
+    parts.next().expect("viewBox minY");
+    let width: f64 = parts
+        .next()
+        .expect("viewBox width")
+        .parse()
+        .expect("viewBox width should be a number");
+    let height: f64 = parts
+        .next()
+        .expect("viewBox height")
+        .parse()
+        .expect("viewBox height should be a number");
+    (width, height)
+}
+
+#[tokio::test]
+async fn render_url_direction_lr_draws_a_wider_than_tall_svg() {
+    // MAJOR correctness fix: the requested direction must always be
+    // what Graphviz actually draws, not just what the response reports.
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro"), "direction": "lr" }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "lr");
+    let svg = body["svg"].as_str().expect("svg should be a string");
+    let (width, height) = viewbox_dims(svg);
+    assert!(
+        width > height,
+        "expected a wider-than-tall LR drawing, got {width}x{height}: {svg}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_requested_direction_overrides_the_sources_rankdir_in_both_response_and_drawing()
+{
+    // MAJOR correctness fix: a source `rankdir=LR` must not win over an
+    // explicitly requested `tb` — neither in the reported `direction`
+    // nor in the actual drawing.
+    const DOT: &str = r"digraph Demo {
+        rankdir=LR
+        start [shape=Mdiamond]
+        exit  [shape=Msquare]
+        start -> exit
+    }";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro"), "direction": "tb" }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["direction"], "tb");
+    let svg = body["svg"].as_str().expect("svg should be a string");
+    let (width, height) = viewbox_dims(svg);
+    assert!(
+        height > width,
+        "expected a taller-than-wide TB drawing, got {width}x{height}: {svg}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_strips_links_from_the_rendered_svg() {
+    // AC11: untrusted-source SVG must be sanitized end to end through the
+    // real endpoint, not just the sanitize_svg unit tests.
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond]
+        evil [URL="javascript:alert(1)", href="https://evil.example", shape=box]
+        exit [shape=Msquare]
+        start -> evil -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    let svg = body["svg"].as_str().expect("svg should be a string");
+    assert!(!svg.contains("href="), "{svg}");
+    assert!(!svg.contains("xlink:href"), "{svg}");
+    assert!(!svg.contains("<script"), "{svg}");
+    assert!(!svg.contains("<foreignObject"), "{svg}");
+    assert!(!svg.contains("<a "), "{svg}");
+    assert!(
+        svg.contains("evil"),
+        "the node's own title/class should survive: {svg}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_neutralizes_a_fontname_attribute_breakout() {
+    // CRITICAL: Graphviz writes a node's `fontname` unescaped into
+    // `font-family="..."`. A value containing `"><?xml ...?>` survived
+    // `sanitize_svg`'s old `other =>` passthrough (the XML declaration
+    // it parses to was written straight back out); an HTML tokenizer
+    // treats any `<?...?>` as a "bogus comment" ending at the first
+    // `>`, running the rest as markup.
+    //
+    // MAJOR: a second node's `fontname` carries the companion `<style>`
+    // breakout — once the first `"` closes the attribute early and the
+    // `>` closes the tag, the literal `</text><style>@import
+    // url(...)...</style><text q="` that follows parses as real
+    // sibling markup, including a genuine (attacker-controlled)
+    // `<style>` element. `style` is no longer in the sanitizer's
+    // element allowlist at all, so it — and the `@import` inside it —
+    // must be dropped like any other disallowed element; the only
+    // `<style` left standing must be Fabro's own dark-mode block, added
+    // by `postprocess_svg` after sanitizing.
+    //
+    // Security fix, source side: a third node's `fontname`, and an
+    // edge's `fontname` (an edge label's font), carry a `cursor`/
+    // `style` breakout (the browser-side outbound-load channel from a
+    // later review round — `image-set(...)`/`cursor: url(...)` can
+    // make a viewer's browser fetch an attacker host). `fontname` on an
+    // edge exercises the same `RAW_TEXT_ATTRS` neutralization
+    // `labelfontname` would (both land in `font-family="..."` the same
+    // way — see `fabro_dot::graphviz`'s own unit tests for
+    // `labelfontname` directly: Fabro's workflow dialect does not
+    // define `labelfontname`/`headlabel`/`taillabel` at all, so a
+    // workflow carrying them never reaches this handler, let alone
+    // Graphviz, through the validated `render-url` pipeline this test
+    // exercises). `render_url_source` (`fabro_dot::graphviz`) now drops
+    // any `fontname`/`labelfontname`/`stylesheet` value containing
+    // `"`/`<`/`>`/`&` before Graphviz ever sees it, so these never
+    // reach the raw Graphviz output at all; `sanitize_svg`'s
+    // per-element attribute allowlist (neither `cursor` nor `style` on
+    // `text` is in it) is the defense-in-depth backstop if they ever
+    // did.
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond, fontname="Helvetica\"><?xml q=\"><img src=x onerror=alert(document.domain)>\"?>"]
+        mid [shape=box, fontname="F\">x</text><style>@import url(https://evil.example/a.css); body{background:url(https://evil.example/b)}</style><text q=\""]
+        breakout3 [shape=box, fontname="F\" cursor=\"url(https://evil.example/c.png),auto\" style=\"mask-image:image-set('https://evil.example/m.png' 1x)\""]
+        exit [shape=Msquare]
+        start -> mid
+        mid -> breakout3 [label="E", fontname="LF\" cursor=\"url(https://evil.example/d.png),auto\" style=\"mask-image:image-set('https://evil.example/e.png' 1x)\""]
+        breakout3 -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    let svg = body["svg"].as_str().expect("svg should be a string");
+    assert!(!svg.contains("onerror"), "{svg}");
+    assert!(!svg.contains("<img"), "{svg}");
+    assert!(!svg.contains("<?"), "{svg}");
+    assert!(!svg.contains("evil.example"), "{svg}");
+    assert_eq!(
+        svg.matches("<style").count(),
+        1,
+        "only the dark-mode block should remain: {svg}"
+    );
+    // Every unsafe `fontname` must be dropped outright, not merely
+    // truncated at its first unsafe character: the neutralized
+    // attribute's value should never reach `font-family="..."` even as
+    // a prefix, so Graphviz falls back to its own default font instead.
+    for leaked_prefix in [
+        r#"font-family="F""#,
+        r#"font-family="LF""#,
+        r#"font-family="Helvetica""#,
+    ] {
+        assert!(!svg.contains(leaked_prefix), "{leaked_prefix}: {svg}");
+    }
+}
+
+#[tokio::test]
+async fn render_url_requires_authentication() {
+    let state = TestAppStateBuilder::new().build();
+    let app = build_router(Arc::clone(&state), test_auth_mode());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": "https://example.com/workflow.fabro" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_status!(response, StatusCode::UNAUTHORIZED).await;
+}
+
+#[tokio::test]
+async fn render_url_refuses_disallowed_schemes_and_hosts() {
+    let (_state, app) = render_url_app_production();
+    for (url, expected_code) in [
+        ("http://example.com/workflow.fabro", "scheme_not_https"),
+        (
+            "https://user:pass@example.com/workflow.fabro",
+            "invalid_url",
+        ),
+        ("https://127.0.0.1/workflow.fabro", "host_not_allowed"),
+        ("https://[::1]/workflow.fabro", "host_not_allowed"),
+        ("https://10.0.0.1/workflow.fabro", "host_not_allowed"),
+        ("https://169.254.169.254/workflow.fabro", "host_not_allowed"),
+        ("https://[fd00::1]/workflow.fabro", "host_not_allowed"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(render_url_request(&json!({ "url": url })))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "url={url} body={body}");
+        assert_eq!(body["errors"][0]["code"], expected_code, "url={url}");
+    }
+}
+
+#[tokio::test]
+async fn render_url_refuses_redirect_to_a_private_address() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/start");
+            then.status(302)
+                .header("location", "http://10.0.0.1/workflow.fabro");
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(&json!({ "url": server.url("/start") })))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(body["errors"][0]["code"], "host_not_allowed");
+}
+
+#[tokio::test]
+async fn render_url_refuses_more_than_three_redirects() {
+    let server = MockServer::start_async().await;
+    for hop in 0..4 {
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path(format!("/hop{hop}"));
+                then.status(302)
+                    .header("location", format!("/hop{}", hop + 1));
+            })
+            .await;
+    }
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(&json!({ "url": server.url("/hop0") })))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(body["errors"][0]["code"], "host_not_allowed");
+}
+
+#[tokio::test]
+async fn render_url_drops_authorization_header_on_cross_host_redirect() {
+    let origin = MockServer::start_async().await;
+    let destination = MockServer::start_async().await;
+    let origin_saw_auth = Arc::new(AtomicBool::new(false));
+    let origin_captured = Arc::clone(&origin_saw_auth);
+    let saw_auth = Arc::new(AtomicBool::new(false));
+    let captured = Arc::clone(&saw_auth);
+    destination
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.respond_with(move |request: &httpmock::HttpMockRequest| {
+                captured.store(
+                    request
+                        .headers_vec()
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+                    Ordering::SeqCst,
+                );
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .body(MINIMAL_DOT)
+                    .build()
+            });
+        })
+        .await;
+    origin
+        .mock_async(move |when, then| {
+            when.method(GET).path("/start");
+            then.respond_with(move |request: &httpmock::HttpMockRequest| {
+                origin_captured.store(
+                    request
+                        .headers_vec()
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+                    Ordering::SeqCst,
+                );
+                httpmock::HttpMockResponse::builder()
+                    .status(302)
+                    .header("location", "http://destination.test/workflow.fabro")
+                    .build()
+            });
+        })
+        .await;
+
+    let policy = graph_url_policy_with_hosts(vec![
+        ("origin.test", *origin.address()),
+        ("destination.test", *destination.address()),
+    ]);
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(policy)
+        .graph_url_credential(
+            "origin.test",
+            fabro_http::HeaderValue::from_static("Bearer secret-token"),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": "http://origin.test/start" }),
+        ))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+    assert!(
+        origin_saw_auth.load(Ordering::SeqCst),
+        "origin.test should have received the Authorization header (proving it was ever attached)"
+    );
+    assert!(
+        !saw_auth.load(Ordering::SeqCst),
+        "destination host should not receive the origin's Authorization header"
+    );
+}
+
+fn padded_minimal_dot(total_len: usize) -> String {
+    let prefix = "digraph Test {\n    // ";
+    let suffix = "\n    graph [goal=\"Test\"]\n    start [shape=Mdiamond]\n    exit  [shape=Msquare]\n    start -> exit\n}";
+    let pad_len = total_len.saturating_sub(prefix.len() + suffix.len());
+    let mut out = String::with_capacity(total_len);
+    out.push_str(prefix);
+    out.push_str(&"x".repeat(pad_len));
+    out.push_str(suffix);
+    out
+}
+
+#[tokio::test]
+async fn render_url_refuses_a_body_over_the_size_limit() {
+    let server = MockServer::start_async().await;
+    let oversized = vec![b'a'; 3 * 1024 * 1024 + 2];
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(oversized.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "too_large");
+}
+
+#[tokio::test]
+async fn render_url_accepts_a_body_at_the_exact_size_limit_boundary() {
+    // 3 MiB (3 * 1024 * 1024 bytes) is accepted, one byte more is refused
+    // (covered by `render_url_refuses_a_body_over_the_size_limit`): the cap
+    // is enforced by counting streamed bytes as they arrive, not by
+    // trusting any `Content-Length` the server claims.
+    let server = MockServer::start_async().await;
+    let body = padded_minimal_dot(3 * 1024 * 1024);
+    assert_eq!(body.len(), 3 * 1024 * 1024);
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(body.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn render_url_accepts_exactly_three_redirects() {
+    let server = MockServer::start_async().await;
+    for hop in 0..3 {
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path(format!("/hop{hop}"));
+                then.status(302)
+                    .header("location", format!("/hop{}", hop + 1));
+            })
+            .await;
+    }
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/hop3");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(&json!({ "url": server.url("/hop0") })))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn render_url_times_out_on_a_stalled_fetch() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(300))
+                .body(MINIMAL_DOT);
+        })
+        .await;
+    let mut policy = graph_url_policy();
+    policy.fetch_timeout = std::time::Duration::from_millis(50);
+    let (_state, app) = render_url_app(policy);
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::GATEWAY_TIMEOUT).await;
+    assert_eq!(body["errors"][0]["code"], "timeout");
+}
+
+#[tokio::test]
+async fn render_url_reports_upstream_http_status() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/missing.fabro");
+            then.status(404);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/missing.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::BAD_GATEWAY).await;
+    assert_eq!(body["errors"][0]["code"], "http_status");
+    assert_eq!(body["errors"][0]["meta"]["status"], 404);
+}
+
+#[tokio::test]
+async fn render_url_reports_not_parsable_for_non_dot_and_non_utf8() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/not-dot.fabro");
+            then.status(200).body("this is not a dot file at all {{{");
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/not-utf8.fabro");
+            then.status(200).body(&[0xFFu8, 0xFE, 0xFD][..]);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    for path in ["/not-dot.fabro", "/not-utf8.fabro"] {
+        let response = app
+            .clone()
+            .oneshot(render_url_request(&json!({ "url": server.url(path) })))
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["code"], "not_parsable", "path={path}");
+    }
+}
+
+#[tokio::test]
+async fn render_url_lists_unresolved_references_as_notices_without_blocking() {
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond]
+        prompt [prompt="@prompts/plan.md"]
+        schema [type="agent", prompt="schema", output_schema="@schemas/output.json"]
+        imported [import="imports/shared.fabro"]
+        child [shape=house, stack.child_workflow="../child/workflow.fabro"]
+        exit [shape=Msquare]
+        start -> prompt -> schema -> imported -> child -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    let svg = body["svg"].as_str().unwrap();
+    assert!(svg.contains("<svg"));
+    // AC6: the import placeholder and the child-workflow node each draw as
+    // a single node (the import/child file itself is never fetched or
+    // expanded), not zero or more than one.
+    for title in ["imported", "child"] {
+        let needle = format!("<title>{title}</title>");
+        assert_eq!(
+            svg.matches(&needle).count(),
+            1,
+            "expected exactly one {needle} in the svg"
+        );
+    }
+    let notices = body["notices"].as_array().unwrap();
+    let rules: Vec<&str> = notices
+        .iter()
+        .map(|n| n["rule"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|rule| **rule == "attractor.file_not_found")
+            .count(),
+        2,
+        "{rules:?}"
+    );
+    assert!(rules.contains(&"attractor.import"), "{rules:?}");
+    assert!(
+        rules.contains(&"attractor.child_workflow_not_found"),
+        "{rules:?}"
+    );
+    assert_eq!(notices.len(), 4, "{rules:?}");
+}
+
+#[tokio::test]
+async fn render_url_reports_validation_failed_for_a_structural_error() {
+    const DOT: &str = r#"digraph Demo {
+        prompt [prompt="@prompts/plan.md"]
+        exit [shape=Msquare]
+        prompt -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(body["errors"][0]["code"], "validation_failed");
+    let diagnostics = body["errors"][0]["meta"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d["rule"] == "attractor.no_start"),
+        "{diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_reports_validation_failed_for_a_non_reference_error() {
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond]
+        loop [import="workflow.fabro"]
+        exit [shape=Msquare]
+        start -> loop -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(body["errors"][0]["code"], "validation_failed");
+    let diagnostics = body["errors"][0]["meta"]["diagnostics"].as_array().unwrap();
+    assert!(!diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(
+        diagnostics.iter().all(|d| !d["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("file not found")),
+        "a non-reference error should not be classified as an unresolved-reference notice: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics[0]["rule"], "attractor.import");
+    assert_eq!(diagnostics[0]["line"], 3);
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("circular import detected"),
+        "{diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_reports_validation_failed_for_a_templated_import_path() {
+    // AC8: a static reference (`import`) may not contain template syntax;
+    // this is a validation error, not an unresolved-reference notice.
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond]
+        loop [import="{{ inputs.name }}/workflow.fabro"]
+        exit [shape=Msquare]
+        start -> loop -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(body["errors"][0]["code"], "validation_failed");
+    let diagnostics = body["errors"][0]["meta"]["diagnostics"].as_array().unwrap();
+    assert!(!diagnostics.is_empty(), "{diagnostics:?}");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["rule"], "attractor.import");
+    assert_eq!(diagnostic["line"], 3);
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be a static reference")),
+        "a templated import path is a validation error, not an unresolved-reference notice: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_reports_validation_failed_for_a_missing_include() {
+    // AC8: an inline template's `{% include %}` of a file this single-file
+    // render never loaded is a validation error, not a notice (unlike an
+    // `@file` prompt/schema or child-workflow reference).
+    const DOT: &str = r#"digraph Demo {
+        start [shape=Mdiamond]
+        work [prompt="Hello {% include \"missing.md\" %}"]
+        exit [shape=Msquare]
+        start -> work -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(body["errors"][0]["code"], "validation_failed");
+    let diagnostics = body["errors"][0]["meta"]["diagnostics"].as_array().unwrap();
+    assert!(!diagnostics.is_empty(), "{diagnostics:?}");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["rule"], "attractor.template");
+    assert_eq!(diagnostic["line"], 3);
+    assert!(
+        diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing.md")),
+        "{diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_refuses_a_graph_over_the_node_limit() {
+    use std::fmt::Write as _;
+
+    use fabro_dot::limits;
+
+    // AC19-20: counted after parsing and before validation; the dangerous
+    // quadratic-memory validation pass never runs for a graph this large.
+    let mut dot = String::from("digraph TooBig {\n");
+    for i in 0..=limits::MAX_NODES {
+        let _ = writeln!(dot, "n{i}");
+    }
+    dot.push('}');
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert_eq!(
+        body["errors"][0]["meta"],
+        json!({"limit": "nodes", "count": limits::MAX_NODES + 1, "max": limits::MAX_NODES})
+    );
+}
+
+#[tokio::test]
+async fn render_url_refuses_a_graph_over_the_statement_limit() {
+    use fabro_dot::limits;
+
+    // AC20(d): 1 node declared MAX_STATEMENTS+1 times stays far under
+    // MAX_NODES, so this isolates the statement limit. graph_too_large is
+    // returned before the render subprocess is ever reached.
+    let mut dot = String::from("digraph TooBig {\n");
+    for _ in 0..=limits::MAX_STATEMENTS {
+        dot.push_str("a;\n");
+    }
+    dot.push('}');
+    assert!(dot.len() < 100_000, "len={}", dot.len());
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert_eq!(
+        body["errors"][0]["meta"],
+        json!({"limit": "statements", "count": limits::MAX_STATEMENTS + 1, "max": limits::MAX_STATEMENTS})
+    );
+}
+
+#[tokio::test]
+async fn render_url_refuses_an_over_limit_graph_even_without_a_start_node() {
+    // AC20(c): the node-count check runs before structural validation, so
+    // a workflow that would also fail attractor.no_start still reports
+    // graph_too_large, not validation_failed.
+    use fabro_dot::limits;
+    let mut dot = String::from("digraph TooBig {\n");
+    for i in 0..=limits::MAX_NODES {
+        let _ = std::fmt::Write::write_fmt(&mut dot, format_args!("n{i}\n"));
+    }
+    dot.push('}');
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+}
+
+#[tokio::test]
+async fn render_url_refuses_a_graph_over_the_attribute_text_limit() {
+    // AC20(b): MAX_NODES nodes (at, not over, the limit) each inheriting a
+    // default just over MAX_ATTRIBUTE_BYTES/MAX_NODES bytes pushes
+    // attribute_bytes just over MAX_ATTRIBUTE_BYTES while the DOT source
+    // itself stays a few KB — needed because MAX_ATTRIBUTE_BYTES ==
+    // MAX_BODY_BYTES, so a single oversized literal value would trip the
+    // body-size cap (too_large) before ever reaching the graph-limit
+    // check.
+    use std::fmt::Write as _;
+
+    use fabro_dot::limits;
+    let per_node = usize::try_from(limits::MAX_ATTRIBUTE_BYTES / limits::MAX_NODES).unwrap() + 10;
+    let mut dot = String::new();
+    let _ = write!(
+        dot,
+        "digraph TooBig {{\n    node [p=\"{}\"]\n",
+        "x".repeat(per_node)
+    );
+    for i in 0..limits::MAX_NODES {
+        let _ = writeln!(dot, "    n{i}");
+    }
+    dot.push('}');
+    assert!(dot.len() < 20_000, "len={}", dot.len());
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert_eq!(body["errors"][0]["meta"]["limit"], "attribute_text");
+    assert_eq!(
+        body["errors"][0]["meta"]["max"],
+        limits::MAX_ATTRIBUTE_BYTES
+    );
+}
+
+#[tokio::test]
+async fn render_url_refuses_a_graph_over_the_edge_limit() {
+    use fabro_dot::limits;
+    // 2,001 single-hop `a->b;` statements: 2,001 edges, only 2 nodes.
+    let mut dot = String::from("digraph TooBig {\n    a [shape=Mdiamond]\n    b [shape=Msquare]\n");
+    for _ in 0..=limits::MAX_EDGES {
+        dot.push_str("    a -> b;\n");
+    }
+    dot.push('}');
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert_eq!(
+        body["errors"][0]["meta"],
+        json!({"limit": "edges", "count": limits::MAX_EDGES + 1, "max": limits::MAX_EDGES})
+    );
+}
+
+#[tokio::test]
+async fn render_url_renders_a_graph_at_the_edge_limit() {
+    use fabro_dot::limits;
+    // Exactly MAX_EDGES single-hop `a->b;` statements must still validate
+    // and render.
+    let mut dot =
+        String::from("digraph AtLimit {\n    a [shape=Mdiamond]\n    b [shape=Msquare]\n");
+    for _ in 0..limits::MAX_EDGES {
+        dot.push_str("    a -> b;\n");
+    }
+    dot.push('}');
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn render_url_refuses_nine_levels_of_subgraph_nesting() {
+    // AC23: the nesting scan runs before the body is otherwise parsed or
+    // validated; the digraph's own `{}` is depth 0, so 9 *nested*
+    // subgraphs (over MAX_NESTING_DEPTH=8) is refused.
+    let dot =
+        "digraph G {".to_string() + &"subgraph { ".repeat(9) + "a } ".repeat(9).as_str() + "}";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert_eq!(
+        body["errors"][0]["meta"],
+        json!({"limit": "nesting_depth", "count": 9, "max": 8})
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_refuses_nine_levels_of_subgraph_nesting_without_spawning_validation() {
+    // AC20(d)/AC23: the nesting scan runs in the handler before any
+    // validation slot is taken, so a too-deep graph never reaches the
+    // bounded `fabro __validate-workflow` subprocess. The override script
+    // would fail loudly (and leave a marker) if it were ever invoked.
+    let dir = tempfile::tempdir().expect("temp dir should exist");
+    let marker = dir.path().join("spawned");
+    let (_script_dir, script_path) = write_test_executable(&format!(
+        "#!/bin/sh\ncat >/dev/null\ntouch {}\nexit 1\n",
+        marker.display(),
+    ));
+    let dot =
+        "digraph G {".to_string() + &"subgraph { ".repeat(9) + "a } ".repeat(9).as_str() + "}";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_validation(
+            Some(script_path),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let permits_before = crate::validation_runner::VALIDATION_SEMAPHORE.available_permits();
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+    assert_eq!(body["errors"][0]["code"], "graph_too_large");
+    assert!(
+        !marker.exists(),
+        "the validation subprocess must never have run"
+    );
+    assert_eq!(
+        crate::validation_runner::VALIDATION_SEMAPHORE.available_permits(),
+        permits_before,
+        "no validation slot should be taken"
+    );
+}
+
+#[tokio::test]
+async fn render_url_renders_a_workflow_nested_exactly_eight_levels_deep() {
+    // AC23: the digraph's own `{}` is depth 0, so exactly 8 *nested*
+    // subgraphs is still accepted.
+    const DOT: &str = r"digraph G {
+        subgraph a1 { subgraph a2 { subgraph a3 { subgraph a4 {
+        subgraph a5 { subgraph a6 { subgraph a7 { subgraph a8 {
+            start [shape=Mdiamond]
+            exit [shape=Msquare]
+            start -> exit
+        } } } }
+        } } } }
+    }";
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn render_url_renders_an_agent_node_with_no_ready_provider_and_warns_on_unbound_input() {
+    const DOT: &str = r#"digraph Agent {
+        start [shape=Mdiamond]
+        work [prompt="Hello {{ inputs.name }}"]
+        exit [shape=Msquare]
+        start -> work -> exit
+    }"#;
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(DOT);
+        })
+        .await;
+    let (_state, app) = render_url_app(graph_url_policy());
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    assert!(body["svg"].as_str().unwrap().contains("<svg"));
+    let warnings = body["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| warning["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("inputs.name")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_url_returns_render_failed_when_no_render_permit_is_available() {
+    let permits: Vec<_> = futures_util::future::join_all(
+        (0..4).map(|_| super::handler::graph::GRAPHVIZ_RENDER_SEMAPHORE.acquire()),
+    )
+    .await
+    .into_iter()
+    .map(|permit| permit.expect("semaphore should not be closed"))
+    .collect();
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_render_limits(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(10),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(body["errors"][0]["code"], "render_failed");
+    drop(permits);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_returns_render_failed_when_the_render_subprocess_is_killed() {
+    // AC12, handler-level (unlike
+    // `render_dot_subprocess_kills_a_hung_render_after_the_limit` below, which
+    // calls the subprocess wrapper directly): a hung Graphviz render reached
+    // through the full render-url HTTP path still fails with `render_failed`
+    // (503) well inside the request's own budget, not the kill timeout.
+    let (_dir, script_path) = write_test_executable("#!/bin/sh\ncat >/dev/null\nsleep 30\n");
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_render_exe(script_path)
+        .graph_url_render_limits(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(200),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(body["errors"][0]["code"], "render_failed");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_dot_subprocess_kills_a_hung_render_after_the_limit() {
+    // AC12: a hung render subprocess is killed and the request fails with
+    // render_failed, not left hanging.
+    let (_dir, script_path) = write_test_executable("#!/bin/sh\ncat >/dev/null\nsleep 30\n");
+
+    let started = std::time::Instant::now();
+    let err = super::handler::graph::render_dot_subprocess_with_limits(
+        "digraph { a -> b }",
+        Some(&script_path),
+        Some(std::time::Duration::from_secs(1)),
+        Some(std::time::Duration::from_millis(200)),
+    )
+    .await
+    .expect_err("a hung render should be killed");
+
+    assert!(matches!(
+        err,
+        super::handler::graph::RenderSubprocessError::Killed
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_dot_subprocess_kills_a_child_that_never_reads_a_large_stdin_within_the_limit() {
+    // Risk finding: the only prior render-path kill test used a stub that
+    // drains stdin (`cat >/dev/null`) before sleeping, so it never
+    // exercised the stdin-write side of the shared deadline. A stub that
+    // never reads stdin at all, fed a DOT larger than the pipe buffer
+    // (never validated at ~1 MiB here), must still be killed within
+    // `kill_after` rather than hanging on the write.
+    let (_dir, script_path) = write_test_executable("#!/bin/sh\nsleep 30\n");
+    let large_dot = format!("digraph {{ {} }}", "a ".repeat(600_000));
+    assert!(large_dot.len() > 1024 * 1024, "{}", large_dot.len());
+
+    let started = std::time::Instant::now();
+    let err = super::handler::graph::render_dot_subprocess_with_limits(
+        &large_dot,
+        Some(&script_path),
+        Some(std::time::Duration::from_secs(1)),
+        Some(std::time::Duration::from_millis(200)),
+    )
+    .await
+    .expect_err("a child that never reads stdin should be killed");
+
+    assert!(matches!(
+        err,
+        super::handler::graph::RenderSubprocessError::Killed
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_refuses_an_oversized_rendered_svg() {
+    // Security MAJOR: the render-url child's stdout is capped at
+    // `RENDER_URL_MAX_SVG_BYTES`. The stub below prints *well-formed*
+    // SVG over the cap — a balanced `<svg>...<text>...</text></svg>` —
+    // rather than an unclosed fragment, so this test actually
+    // discriminates the cap: with the cap removed, the handler would
+    // sanitize this exact output and return it as a normal 200 (proven
+    // separately, not in-tree, by rerunning this test against a build
+    // with the cap lifted). A Graphviz amplification bomb (here, a stub
+    // standing in for one) producing more must never be buffered in
+    // full — the request fails with `render_failed` (503) and a small,
+    // fixed body, not the raw (multi-MB) child output.
+    let cap = super::handler::graph::RENDER_URL_MAX_SVG_BYTES;
+    let over_cap = cap + 1024 * 1024;
+    let (_dir, script_path) = write_test_executable(&format!(
+        "#!/bin/sh\ncat >/dev/null\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\"><text>'\nhead -c {over_cap} /dev/zero | tr '\\0' a\nprintf '</text></svg>'\n",
+    ));
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_render_exe(script_path)
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        bytes.len() < 4096,
+        "error body should be small, got {} bytes",
+        bytes.len()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body should be JSON");
+    assert_eq!(body["errors"][0]["code"], "render_failed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_dot_subprocess_reports_output_too_large_for_a_well_formed_oversized_svg() {
+    // Direct counterpart of `render_url_refuses_an_oversized_rendered_svg`,
+    // calling the subprocess wrapper itself so the specific error
+    // (`OutputTooLarge`, not just some failure) is asserted directly,
+    // with the same well-formed-over-the-cap stub.
+    let cap = super::handler::graph::RENDER_URL_MAX_SVG_BYTES;
+    let over_cap = cap + 1024 * 1024;
+    let (_dir, script_path) = write_test_executable(&format!(
+        "#!/bin/sh\ncat >/dev/null\nprintf '<svg xmlns=\"http://www.w3.org/2000/svg\"><text>'\nhead -c {over_cap} /dev/zero | tr '\\0' a\nprintf '</text></svg>'\n",
+    ));
+
+    let err = super::handler::graph::render_dot_subprocess_with_limits(
+        "digraph { a -> b }",
+        Some(&script_path),
+        Some(std::time::Duration::from_secs(5)),
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .await
+    .expect_err("output over the cap should be refused");
+
+    assert!(matches!(
+        err,
+        super::handler::graph::RenderSubprocessError::OutputTooLarge
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_dot_subprocess_kills_a_never_ending_stream_before_the_kill_timeout() {
+    // MINOR wiring test: the output-size cap must kill the child as soon
+    // as it is hit, not wait out `kill_after`. Proven with a
+    // never-ending stdout stream (never closes `<svg><text>`, never
+    // stops writing) and a generous 30 s `kill_after`: if the cap's own
+    // kill wiring regressed and stopped short-circuiting the wait, this
+    // would hang for the full 30 s and report `Killed`, not
+    // `OutputTooLarge`. The time bound stays well under 30 s but loose
+    // enough for a loaded CI runner (5.5 s was seen under a parallel build).
+    let (_dir, script_path) = write_test_executable(
+        "#!/bin/sh\ncat >/dev/null\nprintf '<svg><text>'\nyes a | tr -d '\\n'\n",
+    );
+
+    let started = std::time::Instant::now();
+    let err = super::handler::graph::render_dot_subprocess_with_limits(
+        "digraph { a -> b }",
+        Some(&script_path),
+        Some(std::time::Duration::from_secs(5)),
+        Some(std::time::Duration::from_secs(30)),
+    )
+    .await
+    .expect_err("a never-ending stdout stream should hit the size cap");
+
+    assert!(matches!(
+        err,
+        super::handler::graph::RenderSubprocessError::OutputTooLarge
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn render_url_leaves_runs_unchanged_after_success_and_failure() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let (state, app) = render_url_app(graph_url_policy());
+
+    let before = state.runs.lock().expect("runs lock poisoned").len();
+
+    let ok_response = app
+        .clone()
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+    response_json!(ok_response, StatusCode::OK).await;
+
+    let failed_response = app
+        .oneshot(render_url_request(&json!({ "url": "not a url" })))
+        .await
+        .unwrap();
+    assert_status!(failed_response, StatusCode::BAD_REQUEST).await;
+
+    let after = state.runs.lock().expect("runs lock poisoned").len();
+    assert_eq!(before, 0);
+    assert_eq!(after, 0);
+}
+
+#[tokio::test]
+async fn render_url_returns_render_failed_when_no_validation_slot_is_free() {
+    // AC21: hold both validation slots directly; the handler must time
+    // out waiting for one (the override's 100 ms wait) and return 503
+    // without the subprocess ever running — `validate_dot_source` awaits
+    // the permit before it spawns anything.
+    let permits: Vec<_> = futures_util::future::join_all(
+        (0..2).map(|_| crate::validation_runner::VALIDATION_SEMAPHORE.acquire()),
+    )
+    .await
+    .into_iter()
+    .map(|permit| permit.expect("semaphore should not be closed"))
+    .collect();
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_validation(
+            None,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(10),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let before = state.runs.lock().expect("runs lock poisoned").len();
+
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(body["errors"][0]["code"], "render_failed");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(state.runs.lock().expect("runs lock poisoned").len(), before);
+    drop(permits);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_validation_failed_comes_from_the_subprocess() {
+    // AC29: a script standing in for `__validate-workflow` reports one
+    // Error diagnostic; the handler must surface exactly that diagnostic,
+    // proving outcomes come from the subprocess rather than any in-process
+    // check.
+    let (_dir, script_path) = write_test_executable(
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"status\":\"ok\",\"diagnostics\":[{\"rule\":\"test.rule\",\"severity\":\"error\",\"message\":\"injected by the test script\"}]}'\n",
+    );
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_validation(
+            Some(script_path),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(body["errors"][0]["code"], "validation_failed");
+    let diagnostics = body["errors"][0]["meta"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["rule"], "test.rule");
+    assert_eq!(
+        crate::validation_runner::VALIDATION_SEMAPHORE.available_permits(),
+        crate::validation_runner::VALIDATION_CONCURRENCY_LIMIT
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_renders_when_the_subprocess_reports_only_notices() {
+    // AC29, second case: a script reporting only a reference-notice-shaped
+    // diagnostic renders normally (200), again sourced from the
+    // subprocess's outcome alone.
+    let (_dir, script_path) = write_test_executable(
+        "#!/bin/sh\ncat >/dev/null\nprintf '{\"status\":\"ok\",\"diagnostics\":[{\"rule\":\"attractor.file_not_found\",\"severity\":\"error\",\"message\":\"prompts/x.md not found\"}]}'\n",
+    );
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(MINIMAL_DOT);
+        })
+        .await;
+    let state = TestAppStateBuilder::new()
+        .graph_url_fetch_policy(graph_url_policy())
+        .graph_url_validation(
+            Some(script_path),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
+        )
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+
+    let body = response_json!(response, StatusCode::OK).await;
+    let notices = body["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["rule"], "attractor.file_not_found");
+}
+
+#[tokio::test]
+async fn render_url_leaves_runs_unchanged_after_graph_too_large() {
+    // AC13, extended: graph_too_large must not touch the run list either.
+    let mut dot = String::from("digraph TooBig {\n");
+    {
+        use std::fmt::Write as _;
+        for i in 0..=fabro_dot::limits::MAX_NODES {
+            let _ = writeln!(dot, "n{i}");
+        }
+    }
+    dot.push('}');
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/workflow.fabro");
+            then.status(200).body(dot.clone());
+        })
+        .await;
+    let (state, app) = render_url_app(graph_url_policy());
+    let before = state.runs.lock().expect("runs lock poisoned").len();
+
+    let response = app
+        .oneshot(render_url_request(
+            &json!({ "url": server.url("/workflow.fabro") }),
+        ))
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+
+    assert_eq!(state.runs.lock().expect("runs lock poisoned").len(), before);
+}
+
+async fn runs_list_len(app: &Router) -> usize {
+    let req = Request::builder()
+        .method("GET")
+        .uri(api("/runs"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    body["data"].as_array().unwrap().len()
+}
+
+/// Count rows in the `blobs` table — what
+/// `fabro_workflow_version::WorkflowVersionStore::put` (the store API
+/// `store_workflow_version` uses) and every other content write land in —
+/// through the same pool `AppState` holds.
+async fn blob_count(state: &AppState) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs")
+        .fetch_one(&crate::test_support::test_app_db_pool(state))
+        .await
+        .expect("blob count query should succeed")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn render_url_never_touches_the_durable_run_or_workflow_version_stores() {
+    // AC13, extended (tests-r3 MAJOR): every prior render-url/run-list
+    // test here only read the in-memory `AppState.runs` map. Check the
+    // durable store too — the one `GET /api/v1/runs` lists, and the
+    // WorkflowVersion/blob store `store_workflow_version` writes through —
+    // across every render-url outcome, including the two this suite
+    // previously missed: `too_large` and a validation-subprocess failure.
+
+    // 1. Success.
+    {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/workflow.fabro");
+                then.status(200).body(MINIMAL_DOT);
+            })
+            .await;
+        let (state, app) = render_url_app(graph_url_policy());
+        let runs_before = runs_list_len(&app).await;
+        let blobs_before = blob_count(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(render_url_request(
+                &json!({ "url": server.url("/workflow.fabro") }),
+            ))
+            .await
+            .unwrap();
+        response_json!(response, StatusCode::OK).await;
+
+        assert_eq!(runs_list_len(&app).await, runs_before);
+        assert_eq!(blob_count(&state).await, blobs_before);
+    }
+
+    // 2. too_large.
+    {
+        let server = MockServer::start_async().await;
+        let oversized = vec![b'a'; 3 * 1024 * 1024 + 2];
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/workflow.fabro");
+                then.status(200).body(oversized.clone());
+            })
+            .await;
+        let (state, app) = render_url_app(graph_url_policy());
+        let runs_before = runs_list_len(&app).await;
+        let blobs_before = blob_count(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(render_url_request(
+                &json!({ "url": server.url("/workflow.fabro") }),
+            ))
+            .await
+            .unwrap();
+        assert_status!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+
+        assert_eq!(runs_list_len(&app).await, runs_before);
+        assert_eq!(blob_count(&state).await, blobs_before);
+    }
+
+    // 3. graph_too_large.
+    {
+        let mut dot = String::from("digraph TooBig {\n");
+        {
+            use std::fmt::Write as _;
+            for i in 0..=fabro_dot::limits::MAX_NODES {
+                let _ = writeln!(dot, "n{i}");
+            }
+        }
+        dot.push('}');
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(move |when, then| {
+                when.method(GET).path("/workflow.fabro");
+                then.status(200).body(dot.clone());
+            })
+            .await;
+        let (state, app) = render_url_app(graph_url_policy());
+        let runs_before = runs_list_len(&app).await;
+        let blobs_before = blob_count(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(render_url_request(
+                &json!({ "url": server.url("/workflow.fabro") }),
+            ))
+            .await
+            .unwrap();
+        assert_status!(response, StatusCode::PAYLOAD_TOO_LARGE).await;
+
+        assert_eq!(runs_list_len(&app).await, runs_before);
+        assert_eq!(blob_count(&state).await, blobs_before);
+    }
+
+    // 4. A 503 from no free validation slot (both permits held).
+    {
+        let permits: Vec<_> = futures_util::future::join_all(
+            (0..2).map(|_| crate::validation_runner::VALIDATION_SEMAPHORE.acquire()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore should not be closed"))
+        .collect();
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/workflow.fabro");
+                then.status(200).body(MINIMAL_DOT);
+            })
+            .await;
+        let state = TestAppStateBuilder::new()
+            .graph_url_fetch_policy(graph_url_policy())
+            .graph_url_validation(
+                None,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(10),
+            )
+            .build();
+        let app = crate::test_support::build_test_router(Arc::clone(&state));
+        let runs_before = runs_list_len(&app).await;
+        let blobs_before = blob_count(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(render_url_request(
+                &json!({ "url": server.url("/workflow.fabro") }),
+            ))
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(body["errors"][0]["code"], "render_failed");
+
+        assert_eq!(runs_list_len(&app).await, runs_before);
+        assert_eq!(blob_count(&state).await, blobs_before);
+        drop(permits);
+    }
+
+    // 5. A 503 from the validation subprocess itself crashing.
+    {
+        let (_dir, script_path) = write_test_executable("#!/bin/sh\ncat >/dev/null\nexit 1\n");
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/workflow.fabro");
+                then.status(200).body(MINIMAL_DOT);
+            })
+            .await;
+        let state = TestAppStateBuilder::new()
+            .graph_url_fetch_policy(graph_url_policy())
+            .graph_url_validation(
+                Some(script_path),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+            )
+            .build();
+        let app = crate::test_support::build_test_router(Arc::clone(&state));
+        let runs_before = runs_list_len(&app).await;
+        let blobs_before = blob_count(&state).await;
+
+        let response = app
+            .clone()
+            .oneshot(render_url_request(
+                &json!({ "url": server.url("/workflow.fabro") }),
+            ))
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::SERVICE_UNAVAILABLE).await;
+        assert_eq!(body["errors"][0]["code"], "render_failed");
+
+        assert_eq!(runs_list_len(&app).await, runs_before);
+        assert_eq!(blob_count(&state).await, blobs_before);
+    }
+}
+
+fn github_token_app_state_for_graph_url(
+    token: &str,
+    policy: graph_url_fetch::FetchPolicy,
+) -> Arc<AppState> {
+    let (store, artifact_store) = test_store_bundle();
+    let vault_path = test_secret_store_path();
+    let server_env_path = vault_path.with_file_name("server.env");
+    let active_config_path = vault_path.with_file_name("settings.toml");
+    Vault::load(vault_path.clone())
+        .expect("test vault should load")
+        .set("GITHUB_TOKEN", token, SecretType::Token, None)
+        .expect("test github token should be writable");
+    let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
+    let preloaded_vault = crate::test_support::test_secret_snapshot(db_pool.clone())
+        .expect("test secret snapshot should build");
+    let config = AppStateConfig {
+        resolved_settings: resolved_runtime_settings_for_tests(
+            github_token_settings(),
+            RunLayer::default(),
+            LlmLayer::default(),
+        ),
+        execute_in_process: false,
+        max_concurrent_runs: 5,
+        store,
+        artifact_store,
+        db_pool,
+        preloaded_vault,
+        server_secrets: load_test_server_secrets(server_env_path, HashMap::new()),
+        env_lookup: Arc::new(|_: &str| None),
+        github_api_base_url: None,
+        active_config_path,
+        http_client: Some(fabro_http::test_http_client().expect("test HTTP client should build")),
+        sandbox_inventory: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        worker_control_bus: None,
+        worker_runtime: None,
+        graph_url_fetch_policy_override: Some(policy),
+        graph_url_render_limits_override: None,
+        graph_url_render_exe_override: None,
+        graph_url_validation_override: None,
+        graph_url_credential_override: None,
+        automation_materializer_override: None,
+    };
+    build_app_state(config).expect("test app state should build")
+}
+
+#[tokio::test]
+async fn render_url_sends_github_credentials_only_to_raw_githubusercontent_com() {
+    use base64::Engine as _;
+    let server = MockServer::start_async().await;
+    let seen_auth = Arc::new(std::sync::OnceLock::<String>::new());
+    let captured = Arc::clone(&seen_auth);
+    server
+        .mock_async(move |when, then| {
+            when.method(GET).path("/acme/widgets/main/workflow.fabro");
+            then.respond_with(move |request: &httpmock::HttpMockRequest| {
+                if let Some(value) = request
+                    .headers_vec()
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone())
+                {
+                    let _ = captured.set(value);
+                }
+                httpmock::HttpMockResponse::builder()
+                    .status(200)
+                    .body(MINIMAL_DOT)
+                    .build()
+            });
+        })
+        .await;
+    let policy =
+        graph_url_policy_with_hosts(vec![("raw.githubusercontent.com", *server.address())]);
+    let state = github_token_app_state_for_graph_url("ghu_test_token", policy);
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(render_url_request(&json!({
+            "url": "http://raw.githubusercontent.com/acme/widgets/main/workflow.fabro?token=GHSAT0AAAA"
+        })))
+        .await
+        .unwrap();
+
+    response_json!(response, StatusCode::OK).await;
+    let auth = seen_auth
+        .get()
+        .cloned()
+        .expect("raw.githubusercontent.com should receive an Authorization header");
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("x-access-token:ghu_test_token")
+    );
+    assert_eq!(auth, expected);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn render_graph_bytes_returns_bad_request_for_render_error_protocol() {
@@ -10736,6 +12865,11 @@ methods = ["dev-token"]
         shutdown: tokio_util::sync::CancellationToken::new(),
         worker_control_bus: None,
         worker_runtime: None,
+        graph_url_fetch_policy_override: None,
+        graph_url_render_limits_override: None,
+        graph_url_render_exe_override: None,
+        graph_url_validation_override: None,
+        graph_url_credential_override: None,
         automation_materializer_override: None,
     }) else {
         panic!("build_app_state should require SESSION_SECRET")
@@ -10794,6 +12928,11 @@ fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
         shutdown: tokio_util::sync::CancellationToken::new(),
         worker_control_bus: None,
         worker_runtime: None,
+        graph_url_fetch_policy_override: None,
+        graph_url_render_limits_override: None,
+        graph_url_render_exe_override: None,
+        graph_url_validation_override: None,
+        graph_url_credential_override: None,
         automation_materializer_override: None,
     })
     .expect("slack disabled test app state should build");

@@ -5,13 +5,15 @@
     reason = "This crate intentionally re-exports reqwest types behind the approved facade."
 )]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use fabro_static::EnvVars;
+pub use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 pub use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 pub use reqwest::{
-    Body, Method, RequestBuilder, Response, StatusCode, Url, header, multipart, tls,
+    Body, Method, RequestBuilder, Response, StatusCode, Url, header, multipart, redirect, tls,
 };
 
 pub type HttpClient = reqwest::Client;
@@ -20,6 +22,29 @@ pub type BlockingHttpClient = reqwest::blocking::Client;
 pub type BlockingRequestBuilder = reqwest::blocking::RequestBuilder;
 pub type BlockingResponse = reqwest::blocking::Response;
 pub type Proxy = reqwest::Proxy;
+
+/// A [`Resolve`] that always returns the same fixed address set, regardless
+/// of the name being resolved. Pins a connection to addresses a caller
+/// already resolved and vetted, closing the DNS-rebinding gap between
+/// vetting a hostname and connecting to it.
+#[derive(Clone, Debug)]
+struct FixedAddrResolver {
+    addrs: Vec<SocketAddr>,
+}
+
+impl Resolve for FixedAddrResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        let addrs = self.addrs.clone();
+        Box::pin(async move { Ok(Box::new(addrs.into_iter()) as Addrs) })
+    }
+}
+
+/// Build a [`Resolve`] that connects to `addrs` for any hostname asked,
+/// instead of performing DNS resolution.
+#[must_use]
+pub fn resolve_to_addrs(addrs: Vec<SocketAddr>) -> std::sync::Arc<dyn Resolve> {
+    std::sync::Arc::new(FixedAddrResolver { addrs })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyPolicy {
@@ -182,6 +207,15 @@ impl HttpClientBuilder {
     #[must_use]
     pub fn read_timeout(mut self, timeout: Duration) -> Self {
         self.inner = self.inner.read_timeout(timeout);
+        self
+    }
+
+    /// Pins connections to `resolver`'s addresses instead of performing
+    /// normal DNS resolution. Combine with [`resolve_to_addrs`] to connect
+    /// to an address a caller already resolved and vetted.
+    #[must_use]
+    pub fn dns_resolver(mut self, resolver: std::sync::Arc<dyn Resolve>) -> Self {
+        self.inner = self.inner.dns_resolver(resolver);
         self
     }
 }

@@ -54,7 +54,7 @@ let loading = false;
 let available = stages;
 const logRequests: string[] = [];
 mock.module("../lib/queries", () => ({
-  useRunGraph: () => ({ data: undefined }),
+  useRunGraph: () => ({ data: "<svg></svg>" }),
   useRunGraphSource: () => ({ data: undefined }),
   useRun: () => ({ data: undefined }),
   useRunStages: () => ({
@@ -80,13 +80,17 @@ mock.module("../components/run-summary-panel", () => ({
   RunSummaryPanel: () => null,
 }));
 let graphClick: (id: string) => void;
+let graphHoverChange: (hover: unknown) => void;
 mock.module("../hooks/use-annotated-run-graph-svg", () => ({
   useAnnotatedRunGraphSvg: ({
     onStageClick,
+    onHoverChange,
   }: {
     onStageClick: (id: string) => void;
+    onHoverChange: (hover: unknown) => void;
   }) => {
     graphClick = onStageClick;
+    graphHoverChange = onHoverChange;
   },
 }));
 const { default: RunOverview } = await import("./run-overview");
@@ -327,5 +331,19 @@ describe("other stage navigation surfaces", () => {
       `/runs/run-1/stages/${encodeURIComponent(ids[1])}`,
     );
     expectSelected(ids[1]);
+  });
+
+  test("openStage keeps a stable identity across re-renders (regression: the GraphViewport extraction dropped its useCallback, so useAnnotatedRunGraphSvg's DOM-annotation effect — which depends on it — rebuilt on every render)", () => {
+    render("/runs/run-1");
+    const first = graphClick;
+    expect(first).toBeDefined();
+    // Force a real RunOverview re-render: `renderer.update` with the same
+    // router element does not re-render it (RouterProvider renders a
+    // memoized DataRoutes with unchanged props), so call the real
+    // `setHoveredNode` state setter the mocked hook was given instead.
+    act(() => {
+      graphHoverChange({ stage: { id: "marker" }, rect: {} });
+    });
+    expect(graphClick).toBe(first);
   });
 });

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
-use fabro_dot::normalize_for_graphviz;
+use fabro_dot::{last_root_rankdir, normalize_for_graphviz, render_url_source, with_root_rankdir};
 
 /// Dark mode CSS injected into SVG output (leading newline included for
 /// insertion).
@@ -24,9 +24,6 @@ const DOT_STYLE_DEFAULTS: &str = r##"
     edge [color="#666666", fontname="Helvetica", fontsize=10, fontcolor="#666666"]
 "##;
 
-static RANKDIR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"rankdir\s*=\s*\w+").expect("hardcoded regex should compile")
-});
 static WHITE_BG_POLYGON_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
         r#"<polygon\b[^>]*fill="white"[^>]*stroke="none"[^>]*/>|<polygon\b[^>]*stroke="none"[^>]*fill="white"[^>]*/>"#,
@@ -34,11 +31,63 @@ static WHITE_BG_POLYGON_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     .expect("hardcoded regex should compile")
 });
 
-/// Rewrite `rankdir=...` in DOT source.
+/// Override `source`'s effective layout direction to `direction`: appends
+/// a new root-scope `rankdir=<direction>` statement, via
+/// `fabro_dot::with_root_rankdir`, guaranteed by DOT's own "last
+/// assignment wins" rule to be what Graphviz actually draws with,
+/// regardless of any earlier root-scope `rankdir` (quoted or not,
+/// anywhere in the root graph) the source already carried. MAJOR
+/// correctness fix: this previously rewrote the first `rankdir=...` a
+/// raw-text regex happened to match, so a later root-scope assignment
+/// (DOT's own tiebreak) still won at render time, and a `rankdir=...`
+/// substring inside a string value (a prompt, a label, a comment) could
+/// be rewritten even though it was never an attribute assignment at
+/// all — in both cases the requested direction silently did not match
+/// what Graphviz drew. Shared with the run-page graph handler (`GET
+/// /runs/{id}/graph`); the fix applies there too.
 #[must_use]
-pub fn apply_direction<'a>(source: &'a str, direction: &str) -> std::borrow::Cow<'a, str> {
-    let replacement = format!("rankdir={direction}");
-    RANKDIR_RE.replace(source, replacement.as_str())
+pub fn apply_direction<'a>(source: &'a str, direction: &str) -> Cow<'a, str> {
+    with_root_rankdir(source, direction)
+}
+
+/// Prepare untrusted, URL-fetched DOT source for the render-url path:
+/// in one parse (via `fabro_dot::render_url_source`), neutralize
+/// Graphviz's raw-text attributes (`fontname`, `labelfontname`,
+/// `stylesheet` — see `fabro_dot`'s own doc comment for which
+/// characters break them out) wherever their value could break out of
+/// the SVG attribute (or processing instruction) Graphviz writes them
+/// into, and, when `direction` is given, override the effective
+/// layout direction exactly as [`apply_direction`] does.
+///
+/// Security fix, source side: `fabro_graphviz::sanitize::sanitize_svg`
+/// is the defense-in-depth backstop over the *rendered* SVG; this is
+/// the matching fix over the *source* text, before Graphviz ever sees
+/// it, for the one untrusted-DOT render path (`POST
+/// /api/v1/graph/render-url`) that needs it — a manifest's own stored
+/// workflow source, and a run's own graph, are already trusted.
+#[must_use]
+pub fn prepare_untrusted_source_for_render<'a>(
+    source: &'a str,
+    direction: Option<&str>,
+) -> Cow<'a, str> {
+    render_url_source(source, direction)
+}
+
+/// The DOT source's effective root-scope `rankdir` value: the *last*
+/// one assigned at the root graph scope (quoted or not; a subgraph's
+/// own `rankdir` is ignored — see `fabro_dot::last_root_rankdir`), only
+/// when it exactly, case-sensitively matches one of the four values
+/// Graphviz itself recognizes (`LR`/`TB`/`BT`/`RL`). Anything else —
+/// wrong case (e.g. `lr`), an unrecognized word, or no `rankdir` at all
+/// — is what Graphviz itself draws as `TB`, so it is reported as absent
+/// here too, matching the drawing rather than the literal source text.
+/// `render-url`'s handler uses this to compute its response's
+/// `direction` field when the request did not ask for one explicitly.
+#[must_use]
+pub fn detect_rankdir(source: &str) -> Option<&'static str> {
+    const RECOGNIZED: [&str; 4] = ["LR", "TB", "BT", "RL"];
+    let value = last_root_rankdir(source)?;
+    RECOGNIZED.into_iter().find(|candidate| *candidate == value)
 }
 
 /// Inject DOT graph-level style defaults, after normalizing Fabro DOT into
@@ -127,6 +176,54 @@ mod tests {
         let source = "digraph { rankdir=LR a -> b }";
         let rewritten = apply_direction(source, "TB");
         assert!(rewritten.contains("rankdir=TB"));
+    }
+
+    #[test]
+    fn detect_rankdir_finds_the_existing_value() {
+        assert_eq!(detect_rankdir("digraph { rankdir=LR a -> b }"), Some("LR"));
+        assert_eq!(
+            detect_rankdir("digraph { rankdir = BT a -> b }"),
+            Some("BT")
+        );
+    }
+
+    #[test]
+    fn detect_rankdir_is_none_without_one() {
+        assert_eq!(detect_rankdir("digraph { a -> b }"), None);
+    }
+    #[test]
+    fn apply_direction_inserts_rankdir_when_absent() {
+        let out = apply_direction("digraph { a -> b }", "LR");
+        assert_eq!(detect_rankdir(&out), Some("LR"));
+    }
+
+    #[test]
+    fn apply_direction_overrides_a_quoted_rankdir() {
+        let source = r#"digraph { rankdir="LR" a -> b }"#;
+        let out = apply_direction(source, "TB");
+        assert_eq!(detect_rankdir(&out), Some("TB"));
+    }
+
+    #[test]
+    fn detect_rankdir_reports_the_wrong_case_as_absent() {
+        // Graphviz recognizes `rankdir` case-sensitively; a value like
+        // `lr` draws the same `TB` layout as no `rankdir` at all, so it
+        // must not be reported as the detected `LR`.
+        assert_eq!(detect_rankdir("digraph { rankdir=lr a -> b }"), None);
+    }
+
+    #[test]
+    fn rankdir_is_not_fooled_by_a_prompt_mentioning_rankdir() {
+        // MAJOR correctness fix: a raw-text regex matched `rankdir=LR`
+        // wherever it appeared in the source, including inside a quoted
+        // string value (a prompt, a label, a comment) that was never an
+        // attribute assignment at all.
+        let source = r#"digraph { prompt="rankdir=LR" a -> b }"#;
+        assert_eq!(detect_rankdir(source), None);
+
+        let out = apply_direction(source, "TB");
+        assert_eq!(detect_rankdir(&out), Some("TB"));
+        assert!(out.contains(r#""rankdir=LR""#), "{out}");
     }
 
     #[test]
@@ -280,5 +377,18 @@ digraph G {
             .collect::<Vec<_>>();
         fixtures.sort();
         fixtures
+    }
+
+    #[test]
+    fn prepare_untrusted_source_for_render_neutralizes_a_fontname_breakout() {
+        let source = r#"digraph X { a [fontname="F\"bad", label="A"] }"#;
+        let out = prepare_untrusted_source_for_render(source, None);
+        assert!(!out.contains("bad"), "{out}");
+    }
+
+    #[test]
+    fn prepare_untrusted_source_for_render_applies_direction() {
+        let out = prepare_untrusted_source_for_render("digraph { a -> b }", Some("LR"));
+        assert_eq!(detect_rankdir(&out), Some("LR"));
     }
 }

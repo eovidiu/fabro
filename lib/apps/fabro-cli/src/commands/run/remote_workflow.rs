@@ -116,6 +116,13 @@ impl NativeGit {
                     ProcessError::TimedOut => RemoteWorkflowError::Timeout,
                     ProcessError::Cancelled => RemoteWorkflowError::Cancelled,
                     ProcessError::Io(source) => RemoteWorkflowError::Io(source),
+                    // Unreachable: this caller uses `capture`, never
+                    // `capture_with_stdin_opts`'s `kill_on_stdout_cap`,
+                    // which is the only path that ever constructs this
+                    // variant.
+                    ProcessError::OutputTooLarge => RemoteWorkflowError::Io(std::io::Error::other(
+                        "subprocess output exceeded its cap",
+                    )),
                 })?;
         if !output.output.status.success() {
             // Output may contain arbitrary helper/config secrets, even after pattern

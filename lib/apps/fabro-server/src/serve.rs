@@ -746,6 +746,16 @@ where
         worker_control_bus: None,
         #[cfg(test)]
         worker_runtime: None,
+        #[cfg(test)]
+        graph_url_fetch_policy_override: None,
+        #[cfg(test)]
+        graph_url_render_limits_override: None,
+        #[cfg(test)]
+        graph_url_render_exe_override: None,
+        #[cfg(test)]
+        graph_url_validation_override: None,
+        #[cfg(test)]
+        graph_url_credential_override: None,
         #[cfg(any(test, feature = "test-support"))]
         automation_materializer_override: None,
     })?;

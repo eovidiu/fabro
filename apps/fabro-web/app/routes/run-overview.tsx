@@ -1,43 +1,47 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { stagePath } from "../lib/stage-routes";
 import { ApiError } from "../lib/api-client";
 import { useRun, useRunGraph, useRunGraphSource, useRunStages } from "../lib/queries";
 import { FloatingTooltip } from "../components/floating-tooltip";
+import { GraphViewport } from "../components/graph-viewport";
 import { PlatformRecordsPanel } from "../components/platform-records-panel";
 import { RunSummaryPanel } from "../components/run-summary-panel";
 import { StagePopover } from "../components/stage-popover";
 import { StageSidebar } from "../components/stage-sidebar";
-import { clampZoom, wheelZoomFactor, zoomAtPoint } from "../lib/graph-viewport";
-import { useElementEvent } from "../hooks/effects";
 import { useRememberedGraphView } from "../hooks/use-remembered-graph-view";
-import { GraphToolbar } from "../components/graph-toolbar";
 import { EmptyState, ErrorState } from "../components/state";
 import {
   mapRunStagesToSidebarStages,
 } from "../lib/stage-sidebar";
-import {
-  useAnnotatedRunGraphSvg,
-  type RunGraphNodeHover,
-} from "../hooks/use-annotated-run-graph-svg";
+import { type RunGraphNodeHover } from "../hooks/use-annotated-run-graph-svg";
 
 export const handle = { wide: true, fullHeight: true };
 
 type Direction = "LR" | "TB";
 
-// Mirrors fabro-graphviz's RANKDIR_RE (lib/components/fabro-graphviz/src/render.rs) —
-// keep the accepted `rankdir=` syntax in sync with that regex.
+// Best-effort direction guess for the initial render, before a user picks
+// one explicitly: the *first* `rankdir=<word>` match in the raw DOT text —
+// including inside a quoted string value (a prompt, a label, a comment)
+// that was never an attribute assignment at all — ignoring any later
+// root-scope assignment that would actually win. This is **not** what the
+// server draws with. `GET /runs/{id}/graph` always draws by
+// `fabro_dot::last_root_rankdir`'s semantics (the *last* root-scope
+// `rankdir`, quoted or not, matched case-sensitively, parsed from the DOT
+// rather than matched against raw text) — the same helper
+// `fabro_graphviz::render::detect_rankdir` uses for `render-url`'s
+// response `direction` field. A source whose first raw match disagrees
+// with that last-assignment value (or whose match is really inside a
+// string, or whose case Graphviz does not recognize) can show the wrong
+// direction button pressed over the graph this page actually draws.
+// Known limitation, not fixed here — see `fabro_dot::last_root_rankdir`'s
+// own doc comment for the server's exact rule.
 const RANKDIR_RE = /rankdir\s*=\s*(\w+)/;
 
 function parseSourceDirection(source: string | undefined): Direction | undefined {
   const value = source?.match(RANKDIR_RE)?.[1];
   return value === "LR" || value === "TB" ? value : undefined;
 }
-
-// Non-passive so the wheel handler can call preventDefault on the browser's own ⌘-zoom.
-// Kept at module scope for a stable identity, since the effect resubscribes when its
-// options object changes.
-const WHEEL_LISTENER_OPTS: AddEventListenerOptions = { passive: false };
 
 export default function RunOverview() {
   const { id } = useParams();
@@ -65,87 +69,22 @@ export default function RunOverview() {
     apiStatus?.kind === "dead"
       ? apiStatus.kind
       : null;
-  const containerRef = useRef<HTMLDivElement>(null);
-  const innerRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
   const navigate = useNavigate();
   const [viewTB, setViewTB] = useRememberedGraphView(id ? `${id}-TB` : undefined);
   const [viewLR, setViewLR] = useRememberedGraphView(id ? `${id}-LR` : undefined);
   const view = activeDirection === "LR" ? viewLR : viewTB;
   const setView = activeDirection === "LR" ? setViewLR : setViewTB;
-  const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
   const [hoveredNode, setHoveredNode] = useState<RunGraphNodeHover | null>(null);
 
+  // Stable identity: passed to GraphViewport -> useAnnotatedRunGraphSvg,
+  // whose DOM-annotation effect depends on it and otherwise rebuilds the
+  // SVG's innerHTML (losing hover/animation state) on every render.
   const openStage = useCallback(
     (stageId: string) => {
       if (id) navigate(stagePath(id, stageId));
     },
     [id, navigate],
   );
-  useAnnotatedRunGraphSvg({
-    graphSvg,
-    innerRef,
-    onHoverChange: setHoveredNode,
-    onStageClick:  openStage,
-    stages,
-    svgRef,
-    terminalOutcome,
-  });
-
-  const onPointerDown = useCallback((e: React.PointerEvent) => {
-    if (e.target instanceof Element && e.target.closest("button, .node")) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    dragState.current = { startX: e.clientX, startY: e.clientY, startPanX: view.pan.x, startPanY: view.pan.y };
-  }, [view.pan]);
-
-  const onPointerMove = useCallback((e: React.PointerEvent) => {
-    const drag = dragState.current;
-    if (!drag) return;
-    setView((v) => ({
-      ...v,
-      pan: {
-        x: drag.startPanX + e.clientX - drag.startX,
-        y: drag.startPanY + e.clientY - drag.startY,
-      },
-    }));
-  }, [setView]);
-
-  const onPointerUp = useCallback(() => {
-    dragState.current = null;
-  }, []);
-
-  // Two-finger scroll pans; ⌘/Ctrl + scroll (and trackpad pinch, which arrives as
-  // ctrl+wheel) zooms anchored at the cursor. Native listener so preventDefault sticks.
-  const onWheel = useCallback((e: WheelEvent) => {
-    const el = containerRef.current;
-    if (!el) return;
-    e.preventDefault();
-    if (e.ctrlKey || e.metaKey) {
-      const r = el.getBoundingClientRect();
-      const cursor = { x: e.clientX - (r.left + r.width / 2), y: e.clientY - (r.top + r.height / 2) };
-      setView((v) => zoomAtPoint(v, wheelZoomFactor(e.deltaY), cursor, activeDirection));
-    } else {
-      setView((v) => ({ ...v, pan: { x: v.pan.x - e.deltaX, y: v.pan.y - e.deltaY } }));
-    }
-  }, [activeDirection, setView]);
-  // The container only exists once the graph has loaded, so gate the listener on
-  // graphSvg. The effect then re-runs and binds once the container is on the page.
-  useElementEvent(containerRef, "wheel", onWheel, WHEEL_LISTENER_OPTS, Boolean(graphSvg));
-
-  const fitToWindow = useCallback(() => {
-    const svg = svgRef.current;
-    const container = containerRef.current;
-    if (!svg || !container) return;
-
-    const svgW = svg.viewBox.baseVal.width || svg.getBoundingClientRect().width;
-    const svgH = svg.viewBox.baseVal.height || svg.getBoundingClientRect().height;
-    const padPx = 48;
-    const containerW = container.clientWidth - padPx;
-    const containerH = container.clientHeight - padPx;
-
-    const fitPct = Math.min(containerW / svgW, containerH / svgH) * 100;
-    setView({ zoom: clampZoom(fitPct, activeDirection), pan: { x: 0, y: 0 } });
-  }, [activeDirection, setView]);
 
   return (
     <div className="flex min-h-0 flex-1 gap-6">
@@ -161,31 +100,17 @@ export default function RunOverview() {
         {graphSvg === undefined && graphQuery.isLoading ? (
           <div className="flex-1" />
         ) : graphSvg ? (
-          <div className="graph-svg relative flex min-h-0 flex-1 flex-col rounded-md border border-line bg-panel-alt">
-            <GraphToolbar
-              direction={activeDirection}
-              setDirection={setDirection}
-              fitToWindow={fitToWindow}
-              zoom={view.zoom}
-              onZoomBy={(factor) => setView((v) => zoomAtPoint(v, factor, undefined, activeDirection))}
-            />
-
-            <div
-              ref={containerRef}
-              className="min-h-0 flex-1 touch-none overflow-hidden overscroll-contain p-6"
-              style={{ cursor: dragState.current ? "grabbing" : "grab" }}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={onPointerUp}
-            >
-              <div
-                ref={innerRef}
-                className="flex h-full items-center justify-center [&_svg]:mx-auto [&_svg]:block"
-                style={{ transform: `translate(${view.pan.x}px, ${view.pan.y}px) scale(${view.zoom / 100})`, transformOrigin: "center center" }}
-              />
-            </div>
-          </div>
+          <GraphViewport
+            svg={graphSvg}
+            direction={activeDirection}
+            setDirection={setDirection}
+            view={view}
+            setView={setView}
+            stages={stages}
+            terminalOutcome={terminalOutcome}
+            onStageClick={openStage}
+            onHoverChange={setHoveredNode}
+          />
         ) : graphQuery.error ? (
           <ErrorState
             title="Couldn't render workflow graph"

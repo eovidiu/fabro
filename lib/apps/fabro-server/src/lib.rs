@@ -28,6 +28,8 @@ pub mod error;
 mod final_patch;
 mod git_checkout;
 pub mod github_webhooks;
+mod graph_url_fetch;
+pub mod graph_validate;
 pub mod install;
 mod interp;
 pub mod jwt_auth;
@@ -55,6 +57,7 @@ mod startup;
 pub mod static_files;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod validation_runner;
 pub mod web_auth;
 mod worker_control;
 mod worker_runtime;

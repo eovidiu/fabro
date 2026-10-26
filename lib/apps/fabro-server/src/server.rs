@@ -159,7 +159,8 @@ use crate::worker_control::{
 use crate::worker_runtime::{LocalWorkerRuntime, WorkerLaunchSpec, WorkerRef, WorkerRuntime};
 use crate::worker_token::{WorkerScopeSet, WorkerTokenKeys, issue_worker_token_with_scopes};
 use crate::{
-    canonical_host, demo, diagnostics, run_manifest, security_headers, static_files, web_auth,
+    canonical_host, demo, diagnostics, graph_url_fetch, run_manifest, security_headers,
+    static_files, validation_runner, web_auth,
 };
 
 mod automation_scheduler;
@@ -1174,6 +1175,20 @@ pub struct AppState {
     slack_service: Option<Arc<SlackService>>,
     slack_started: AtomicBool,
     github_webhook_secret: Option<String>,
+    /// Test-only overrides for `POST /graph/render-url`'s fetch policy,
+    /// render-permit/kill timeouts, and a stubbed GitHub credential, so
+    /// tests can point the fetcher at `httpmock` without a real DNS lookup,
+    /// TLS certificate, or GitHub token. Unset outside the lib's own tests.
+    #[cfg(test)]
+    graph_url_fetch_policy_override: Option<graph_url_fetch::FetchPolicy>,
+    #[cfg(test)]
+    graph_url_render_limits_override: Option<(Duration, Duration)>,
+    #[cfg(test)]
+    graph_url_render_exe_override: Option<PathBuf>,
+    #[cfg(test)]
+    graph_url_validation_override: Option<(Option<PathBuf>, Duration, Duration)>,
+    #[cfg(test)]
+    graph_url_credential_override: Option<(String, fabro_http::HeaderValue)>,
 }
 
 pub(crate) struct AppStores {
@@ -1363,6 +1378,16 @@ pub(crate) struct AppStateConfig {
     pub(crate) worker_runtime: Option<Arc<dyn WorkerRuntime>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) automation_materializer_override: Option<Arc<dyn AutomationRunMaterializer>>,
+    #[cfg(test)]
+    pub(crate) graph_url_fetch_policy_override: Option<graph_url_fetch::FetchPolicy>,
+    #[cfg(test)]
+    pub(crate) graph_url_render_limits_override: Option<(Duration, Duration)>,
+    #[cfg(test)]
+    pub(crate) graph_url_render_exe_override: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) graph_url_validation_override: Option<(Option<PathBuf>, Duration, Duration)>,
+    #[cfg(test)]
+    pub(crate) graph_url_credential_override: Option<(String, fabro_http::HeaderValue)>,
 }
 
 #[derive(Clone)]
@@ -1423,6 +1448,111 @@ impl AppState {
 
     pub(crate) fn active_config_path(&self) -> &std::path::Path {
         &self.active_config_path
+    }
+
+    /// The production fetch policy, or the test-only override (set via
+    /// `TestAppStateBuilder::graph_url_fetch_policy`) that lets handler
+    /// tests point the fetcher at `httpmock`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "Outside tests this always returns the production policy; self only matters for the #[cfg(test)]-only override field."
+        )
+    )]
+    pub(crate) fn graph_url_fetch_policy(&self) -> graph_url_fetch::FetchPolicy {
+        #[cfg(test)]
+        if let Some(policy) = &self.graph_url_fetch_policy_override {
+            return policy.clone();
+        }
+        graph_url_fetch::FetchPolicy::production()
+    }
+
+    /// `(render permit wait, render subprocess kill timeout)`: the
+    /// production constants, or a test-only override of both.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "Outside tests this always returns the production limits; self only matters for the #[cfg(test)]-only override field."
+        )
+    )]
+    pub(crate) fn graph_url_render_limits(&self) -> (Duration, Duration) {
+        #[cfg(test)]
+        if let Some(limits) = self.graph_url_render_limits_override {
+            return limits;
+        }
+        (
+            graph_url_fetch::RENDER_PERMIT_WAIT,
+            graph_url_fetch::RENDER_KILL_TIMEOUT,
+        )
+    }
+
+    /// A test-only override of the render-url Graphviz render child's
+    /// executable, so a handler test can inject a stub script (e.g. one
+    /// that emits an oversized SVG, or a hung/stdin-ignoring child);
+    /// always `None` outside the lib's own tests.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "Outside tests this always returns None; self only matters for the #[cfg(test)]-only override field."
+        )
+    )]
+    pub(crate) fn graph_url_render_exe(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            self.graph_url_render_exe_override.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// `(validation exe override, permit wait, kill timeout)` for
+    /// `POST /graph/render-url`'s bounded `__validate-workflow`
+    /// subprocess: the production constants with no exe override, or a
+    /// test-only override of all three (so a handler test can inject a
+    /// stub script, or hold the slot with a short wait).
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "Outside tests this always returns the production limits; self only matters for the #[cfg(test)]-only override field."
+        )
+    )]
+    pub(crate) fn graph_url_validation_limits(&self) -> (Option<PathBuf>, Duration, Duration) {
+        #[cfg(test)]
+        if let Some(limits) = self.graph_url_validation_override.clone() {
+            return limits;
+        }
+        (
+            None,
+            validation_runner::VALIDATION_PERMIT_WAIT,
+            validation_runner::VALIDATION_KILL_TIMEOUT,
+        )
+    }
+
+    /// A stubbed `(host, Authorization header)` pair tests use in place of
+    /// resolving real GitHub credentials; always `None` outside the lib's
+    /// own tests.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "Outside tests this always returns None; self only matters for the #[cfg(test)]-only override field."
+        )
+    )]
+    pub(crate) fn graph_url_credential_stub(&self) -> Option<(String, fabro_http::HeaderValue)> {
+        #[cfg(test)]
+        {
+            self.graph_url_credential_override.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     }
 
     pub(crate) fn manifest_run_settings(&self) -> std::result::Result<RunNamespace, SharedError> {
@@ -2530,6 +2660,16 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         worker_runtime,
         #[cfg(any(test, feature = "test-support"))]
         automation_materializer_override,
+        #[cfg(test)]
+        graph_url_fetch_policy_override,
+        #[cfg(test)]
+        graph_url_render_limits_override,
+        #[cfg(test)]
+        graph_url_render_exe_override,
+        #[cfg(test)]
+        graph_url_validation_override,
+        #[cfg(test)]
+        graph_url_credential_override,
     } = config;
 
     let store_pool = db_pool.clone();
@@ -2733,6 +2873,16 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         // Startup snapshot for the sync router build; rotating the webhook
         // secret requires a server restart.
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
+        #[cfg(test)]
+        graph_url_fetch_policy_override,
+        #[cfg(test)]
+        graph_url_render_limits_override,
+        #[cfg(test)]
+        graph_url_render_exe_override,
+        #[cfg(test)]
+        graph_url_validation_override,
+        #[cfg(test)]
+        graph_url_credential_override,
     }))
 }
 

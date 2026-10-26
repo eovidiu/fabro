@@ -125,4 +125,8 @@ export const queryKeys = {
     list: () => ["mcp-servers", "list"] as const,
     detail: (id: string) => ["mcp-servers", "detail", id] as const,
   },
+  graph: {
+    renderUrl: (url: string, direction: "LR" | "TB" | undefined) =>
+      ["graph", "render-url", url, direction ?? "auto"] as const,
+  },
 };

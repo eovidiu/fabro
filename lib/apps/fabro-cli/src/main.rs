@@ -51,6 +51,10 @@ async fn main() {
     if subcommand == Some("__render-graph") && !matches!(subcommand_arg, Some("--help" | "-h")) {
         std::process::exit(commands::render_graph::execute());
     }
+    if subcommand == Some("__validate-workflow") && !matches!(subcommand_arg, Some("--help" | "-h"))
+    {
+        std::process::exit(commands::validate_workflow::execute());
+    }
 
     // Capture the worker bearer token immediately and scrub it from the process
     // env before any subprocess can be spawned. Every descendant of the worker
@@ -398,6 +402,9 @@ async fn main_inner(worker_token: Option<String>) -> (String, Result<()>) {
                 unreachable!("__cli-reference handled before CLI bootstrap")
             }
             Commands::RenderGraph => unreachable!("__render-graph handled before CLI bootstrap"),
+            Commands::ValidateWorkflow => {
+                unreachable!("__validate-workflow handled before CLI bootstrap")
+            }
             #[cfg(debug_assertions)]
             Commands::TestPanic { message } => {
                 let event = tel_panic::build_event(&message);
@@ -1529,6 +1536,15 @@ destination = "{destination}"
         let cli = Cli::try_parse_from(["fabro", "__render-graph"]).expect("should parse");
         match *cli.command.unwrap() {
             Commands::RenderGraph => {}
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_validate_workflow_command() {
+        let cli = Cli::try_parse_from(["fabro", "__validate-workflow"]).expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::ValidateWorkflow => {}
             _ => panic!("unexpected command variant"),
         }
     }

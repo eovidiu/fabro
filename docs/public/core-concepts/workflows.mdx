@@ -141,6 +141,28 @@ In the web UI, the Workflows page lists all available workflows. Click into a wo
 
 See the [Quick Start](/getting-started/quick-start) to try it out, or browse the [example workflows](/examples/repl-handoff) for real-world patterns.
 
+## Visualize a workflow from a URL
+
+Click **Visualize** in the web UI's navigation to see a workflow's graph
+without running it. Enter an https URL to one raw `.fabro` workflow file
+(for example a `raw.githubusercontent.com` link) and Fabro loads that single
+file and draws its graph. Private GitHub repositories the server's GitHub
+credentials can read work too.
+
+Visualizing never creates, starts, or schedules a run: nothing is stored,
+and the page's address (`/visualize?url=...`) is the only record. Files the
+workflow references — imports, child workflows, `@file` prompts or schemas —
+are not fetched; Fabro lists them as notices rather than treating them as
+errors. Fabro refuses URLs that are not https, or that resolve to loopback,
+private, link-local, or cloud-metadata addresses, and accepts at most 3 MiB
+within a 10 second fetch. The parsed graph is also checked, before
+validating, against limits of 500 nodes, 2,000 edges, 20,000 statements,
+3 MiB of attribute text, and 8 levels of subgraph nesting; a workflow over
+any of those limits is refused rather than validated. Validation itself
+runs in a bounded subprocess, limited to 1 GiB of memory on Linux and 10
+seconds; at most 2 validations run at once, and a request waits at most 5
+seconds for a slot before it fails.
+
 ## Select workflow source and run target
 
 `fabro run` and `fabro create` accept the same source and target options. `create`

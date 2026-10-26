@@ -48,7 +48,7 @@ pub fn validate_manifest(
 /// defaults the legacy validation judges against, so a bundle that names a
 /// seeded environment validates; no MCP catalog, no model client, no Fabro
 /// home, no run tools.
-fn offline_runtime(run: Option<&RunLayer>) -> RuntimeSpec {
+pub(crate) fn offline_runtime(run: Option<&RunLayer>) -> RuntimeSpec {
     let layer = SettingsLayer {
         version: Some(1),
         environments: fabro_environment::seeded_catalog_layer(),

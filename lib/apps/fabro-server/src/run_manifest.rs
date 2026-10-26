@@ -826,6 +826,10 @@ async fn run_ls_remote(mut command: Command) -> std::result::Result<(), String> 
         ProcessError::TimedOut => "git ls-remote timed out after 10s".to_string(),
         ProcessError::Io(source) => format!("Failed to run git ls-remote: {source}"),
         ProcessError::Cancelled => "git ls-remote cancelled".to_string(),
+        // Unreachable: this caller uses `capture`, never
+        // `capture_with_stdin_opts`'s `kill_on_stdout_cap`, which is the
+        // only path that ever constructs this variant.
+        ProcessError::OutputTooLarge => "git ls-remote output exceeded its cap".to_string(),
     })?
     .output;
 

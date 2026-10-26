@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use super::super::{
     ApiError, AppState, AsyncWriteExt, Command, EnvVars, IntoResponse, Json, LazyLock, Path,
@@ -6,6 +10,7 @@ use super::super::{
     Response, Router, RunId, Semaphore, State, StatusCode, Stdio, apply_render_graph_env, get,
     parse_run_id_path, post, run_manifest,
 };
+use crate::validation_runner::truncate_excerpt;
 
 pub(super) fn manifest_routes() -> Router<Arc<AppState>> {
     Router::new().route("/graph/render", post(render_graph_from_manifest))
@@ -19,8 +24,23 @@ pub(super) fn run_routes() -> Router<Arc<AppState>> {
 
 const RENDER_ERROR_PREFIX: &[u8] = b"RENDER_ERROR:";
 const GRAPHVIZ_RENDER_CONCURRENCY_LIMIT: usize = 4;
+/// Security fix: the render-url child's stdout is capped so a tiny DOT
+/// file amplified by a Graphviz attribute (e.g. `peripheries`) cannot grow
+/// the server's memory past this many bytes; hitting the cap stops
+/// draining immediately and kills the child (via
+/// `fabro_proc::capture_with_stdin_opts`'s `kill_on_stdout_cap`) rather
+/// than buffering more or waiting out the kill timeout, so the shared
+/// [`GRAPHVIZ_RENDER_SEMAPHORE`] permit is released promptly; the request
+/// then fails with `render_failed` (503). Only applied to render-url
+/// (identified by `kill_after` being set); the manifest-render and
+/// run-page graph paths, which render already-validated workflow sources
+/// with no size amplification concern, stay unbounded.
+pub(in crate::server) const RENDER_URL_MAX_SVG_BYTES: usize = 16 * 1024 * 1024;
+/// The same 64 KiB stderr cap `validation_runner` uses for its own bounded
+/// subprocess.
+const RENDER_URL_MAX_STDERR_BYTES: usize = 64 * 1024;
 
-static GRAPHVIZ_RENDER_SEMAPHORE: LazyLock<Semaphore> =
+pub(in crate::server) static GRAPHVIZ_RENDER_SEMAPHORE: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(GRAPHVIZ_RENDER_CONCURRENCY_LIMIT));
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +53,12 @@ pub(in crate::server) enum RenderSubprocessError {
     ProtocolViolation(String),
     #[error("{0}")]
     RenderFailed(String),
+    #[error("render permit wait timed out")]
+    PermitTimeout,
+    #[error("render subprocess did not finish before the kill timeout")]
+    Killed,
+    #[error("render subprocess output exceeded the size limit")]
+    OutputTooLarge,
 }
 
 async fn render_graph_from_manifest(
@@ -116,6 +142,10 @@ fn render_graph_subprocess_exe(
     }
 }
 
+/// MINOR fix: `ChildCrashed` (like `validation_runner`'s own
+/// `ChildCrashed`/`ProtocolViolation`) caps the stderr excerpt it embeds
+/// at `truncate_excerpt`'s 4 KiB rather than logging the subprocess's
+/// full output verbatim.
 fn render_subprocess_failure(
     status: std::process::ExitStatus,
     stderr: &[u8],
@@ -125,7 +155,7 @@ fn render_subprocess_failure(
         use std::os::unix::process::ExitStatusExt;
 
         if let Some(signal) = status.signal() {
-            let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+            let stderr = truncate_excerpt(stderr);
             let detail = if stderr.is_empty() {
                 format!("terminated by signal {signal}")
             } else {
@@ -135,7 +165,7 @@ fn render_subprocess_failure(
         }
     }
 
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stderr = truncate_excerpt(stderr);
     let detail = match status.code() {
         Some(code) if stderr.is_empty() => format!("exited with status {code}"),
         Some(code) => format!("exited with status {code}: {stderr}"),
@@ -149,63 +179,134 @@ pub(in crate::server) async fn render_dot_subprocess(
     dot_source: &str,
     exe_override: Option<&std::path::Path>,
 ) -> Result<Vec<u8>, RenderSubprocessError> {
-    let _permit = GRAPHVIZ_RENDER_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?;
+    render_dot_subprocess_with_limits(dot_source, exe_override, None, None).await
+}
+
+/// Like [`render_dot_subprocess`], but bounds how long to wait for a render
+/// permit (`permit_wait`, else `503 render_failed`) and how long the
+/// subprocess may run before it is killed (`kill_after`, via
+/// `kill_on_drop`). `None` preserves the unbounded waits the manifest-render
+/// path uses.
+pub(in crate::server) async fn render_dot_subprocess_with_limits(
+    dot_source: &str,
+    exe_override: Option<&std::path::Path>,
+    permit_wait: Option<Duration>,
+    kill_after: Option<Duration>,
+) -> Result<Vec<u8>, RenderSubprocessError> {
+    let _permit = match permit_wait {
+        Some(wait) => match timeout(wait, GRAPHVIZ_RENDER_SEMAPHORE.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(err)) => return Err(RenderSubprocessError::SpawnFailed(err.to_string())),
+            Err(_) => return Err(RenderSubprocessError::PermitTimeout),
+        },
+        None => GRAPHVIZ_RENDER_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?,
+    };
     let exe = render_graph_subprocess_exe(exe_override)?;
     let mut cmd = Command::new(exe);
     apply_render_graph_env(&mut cmd);
     cmd.arg("__render-graph")
-        .env(EnvVars::FABRO_TELEMETRY, "off")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env(EnvVars::FABRO_TELEMETRY, "off");
+    // Risk-low fix: on Linux, where the server runs, cap the render
+    // subprocess's address space at 1 GiB too — only for render-url (the
+    // untrusted-input path), identified here by `kill_after` being set
+    // (the manifest-render path passes `None` and keeps today's
+    // unbounded behavior). macOS's RLIMIT_AS does not actually cap
+    // process memory, so this is a no-op there by construction.
+    #[cfg(target_os = "linux")]
+    if kill_after.is_some() {
+        fabro_proc::pre_exec_rlimit_as(cmd.as_std_mut(), 1024 * 1024 * 1024);
+    }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        RenderSubprocessError::SpawnFailed("render subprocess stdin was not piped".to_string())
-    })?;
-    if let Err(err) = stdin.write_all(dot_source.as_bytes()).await {
+    let output = if let Some(limit) = kill_after {
+        // Security fix: render-url is the untrusted-input path, where
+        // a Graphviz attribute like `peripheries` can amplify a tiny
+        // DOT file into a multi-hundred-MB SVG. Cap stdout/stderr and
+        // kill the child the moment the deadline passes, through the
+        // same bounded-capture primitive `validation_runner` uses for
+        // its own subprocess, so the server never buffers more than
+        // the caps allow; a truncated stdout fails the request
+        // outright rather than returning a partial SVG.
+        let cancel = CancellationToken::new();
+        match fabro_proc::capture_with_stdin_opts(
+            &mut cmd,
+            dot_source.as_bytes(),
+            Some(limit),
+            &cancel,
+            Some(RENDER_URL_MAX_SVG_BYTES),
+            Some(RENDER_URL_MAX_STDERR_BYTES),
+            true,
+        )
+        .await
+        {
+            Ok(captured) if captured.stdout_truncated => {
+                return Err(RenderSubprocessError::OutputTooLarge);
+            }
+            Ok(captured) => captured.output,
+            Err(fabro_proc::ProcessError::OutputTooLarge) => {
+                return Err(RenderSubprocessError::OutputTooLarge);
+            }
+            Err(fabro_proc::ProcessError::TimedOut | fabro_proc::ProcessError::Cancelled) => {
+                return Err(RenderSubprocessError::Killed);
+            }
+            Err(fabro_proc::ProcessError::Io(err)) => {
+                return Err(RenderSubprocessError::SpawnFailed(err.to_string()));
+            }
+        }
+    } else {
+        cmd.kill_on_drop(false)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?;
+
+        // Round-1 risk finding: the stdin write must share the same
+        // deadline as the rest of the child's lifetime. The
+        // manifest-render and run-page graph paths render trusted,
+        // already-validated sources with no deadline; this just keeps
+        // the write and wait together.
+        let dot_bytes = dot_source.as_bytes();
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            RenderSubprocessError::SpawnFailed("render subprocess stdin was not piped".to_string())
+        })?;
+        if let Err(err) = stdin.write_all(dot_bytes).await {
+            drop(stdin);
+            let output = child
+                .wait_with_output()
+                .await
+                .map_err(|wait_err| RenderSubprocessError::SpawnFailed(wait_err.to_string()))?;
+            return Err(RenderSubprocessError::ChildCrashed(format!(
+                "failed writing DOT to child stdin: {err}; {}",
+                render_subprocess_failure(output.status, &output.stderr)
+            )));
+        }
         drop(stdin);
-        let output = child
+        child
             .wait_with_output()
             .await
-            .map_err(|wait_err| RenderSubprocessError::SpawnFailed(wait_err.to_string()))?;
-        return Err(RenderSubprocessError::ChildCrashed(format!(
-            "failed writing DOT to child stdin: {err}; {}",
-            render_subprocess_failure(output.status, &output.stderr)
-        )));
-    }
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?;
+            .map_err(|err| RenderSubprocessError::SpawnFailed(err.to_string()))?
+    };
 
     if !output.status.success() {
         return Err(render_subprocess_failure(output.status, &output.stderr));
     }
 
     if let Some(error) = output.stdout.strip_prefix(RENDER_ERROR_PREFIX) {
-        return Err(RenderSubprocessError::RenderFailed(
-            String::from_utf8_lossy(error).trim().to_string(),
-        ));
+        return Err(RenderSubprocessError::RenderFailed(truncate_excerpt(error)));
     }
 
     if output.stdout.starts_with(b"<?xml") || output.stdout.starts_with(b"<svg") {
         return Ok(output.stdout);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     Err(RenderSubprocessError::ProtocolViolation(format!(
         "stdout did not contain SVG or error protocol (stdout: {:?}, stderr: {:?})",
-        stdout.trim(),
-        stderr.trim()
+        truncate_excerpt(&output.stdout),
+        truncate_excerpt(&output.stderr)
     )))
 }
 

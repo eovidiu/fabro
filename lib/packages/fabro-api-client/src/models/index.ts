@@ -327,6 +327,8 @@ export * from './reasoning-output-with-summary';
 export * from './related-workflow-diagnostic';
 export * from './render-workflow-graph-direction';
 export * from './render-workflow-graph-format';
+export * from './render-workflow-graph-from-url-request';
+export * from './render-workflow-graph-from-url-response';
 export * from './render-workflow-graph-request';
 export * from './replace-automation-request';
 export * from './replace-environment-request';

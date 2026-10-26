@@ -20,6 +20,8 @@ mod title;
 pub use flock::{flock_unlock, try_flock_exclusive, try_flock_shared};
 #[cfg(target_os = "linux")]
 pub use pre_exec::pre_exec_pdeathsig;
+#[cfg(target_os = "linux")]
+pub use pre_exec::pre_exec_rlimit_as;
 #[cfg(unix)]
 pub use pre_exec::pre_exec_setpgid;
 #[cfg(unix)]
@@ -34,4 +36,6 @@ pub use signal::{
 pub use title::{init as title_init, set as title_set};
 
 mod process;
-pub use process::{CapturedOutput, ProcessError, capture};
+pub use process::{
+    CapturedOutput, ProcessError, capture, capture_with_stdin, capture_with_stdin_opts,
+};

@@ -31,6 +31,7 @@ import * as RunUsage from "./routes/run-usage";
 import * as Insights from "./routes/insights";
 import * as InsightsEditor from "./routes/insights-editor";
 import * as InsightsNew from "./routes/insights-new";
+import * as Visualize from "./routes/visualize";
 import * as Settings from "./routes/settings";
 import * as SettingsIndex from "./routes/settings-index";
 import * as SettingsGeneral from "./routes/settings-general";
@@ -139,6 +140,7 @@ export const routes: RouteObject[] = [
               route("usage", RunUsage),
             ],
           }),
+          route("visualize", Visualize),
           route("insights", Insights, {
             children: [
               indexRoute(InsightsEditor),

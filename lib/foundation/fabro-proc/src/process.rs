@@ -5,9 +5,10 @@
 use std::future::{self, Future};
 use std::io;
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,8 @@ pub enum ProcessError {
     TimedOut,
     #[error("process I/O failed")]
     Io(#[from] io::Error),
+    #[error("process stdout exceeded its cap; the child was killed rather than drained to EOF")]
+    OutputTooLarge,
 }
 
 impl std::fmt::Debug for ProcessError {
@@ -222,6 +225,114 @@ pub async fn capture(
     })
 }
 
+/// Like [`capture`], but also writes `stdin` to the child's stdin pipe,
+/// under the same deadline as spawning, reading stdout/stderr, and waiting
+/// for exit, with independent stdout/stderr caps.
+///
+/// Writing to a child that never drains its stdin can otherwise block
+/// outside any caller-supplied deadline once the pipe buffer fills (seen in
+/// the render-graph subprocess, where the write ran before the deadline
+/// wrapped anything); folding the write into the same bounded future as the
+/// rest of the child's lifetime closes that gap.
+///
+/// Hitting either cap does not stop the read early: both streams still
+/// drain to EOF (`stdout_truncated`/`stderr_truncated` report it), so a
+/// child that keeps writing past the cap is only stopped by `timeout` or
+/// `cancel`. Most callers (e.g. `validation_runner`, whose subprocess is
+/// always finite) want exactly that. See [`capture_with_stdin_opts`] for
+/// the opt-in that kills the child the moment the stdout cap is hit.
+pub async fn capture_with_stdin(
+    command: &mut Command,
+    stdin: &[u8],
+    timeout: Option<Duration>,
+    cancel: &CancellationToken,
+    stdout_cap: Option<usize>,
+    stderr_cap: Option<usize>,
+) -> Result<CapturedOutput, ProcessError> {
+    capture_with_stdin_opts(
+        command, stdin, timeout, cancel, stdout_cap, stderr_cap, false,
+    )
+    .await
+}
+
+/// Like [`capture_with_stdin`], but when `kill_on_stdout_cap` is set,
+/// hitting the stdout cap stops draining immediately and kills the child
+/// (through the same group-kill `complete`'s failure path uses) rather
+/// than continuing to EOF or waiting out `timeout` — reported as
+/// `Err(ProcessError::OutputTooLarge)`, never `Killed`. Opt-in because
+/// most callers want [`capture_with_stdin`]'s drain-to-EOF behavior;
+/// render-url's Graphviz render opts in so a bomb that keeps writing past
+/// the cap releases the shared render-permit semaphore promptly instead
+/// of holding it until the kill timeout.
+pub async fn capture_with_stdin_opts(
+    command: &mut Command,
+    stdin: &[u8],
+    timeout: Option<Duration>,
+    cancel: &CancellationToken,
+    stdout_cap: Option<usize>,
+    stderr_cap: Option<usize>,
+    kill_on_stdout_cap: bool,
+) -> Result<CapturedOutput, ProcessError> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut owner = ProcessOwner::spawn(command)?;
+    let mut child_stdin = owner.child.stdin.take();
+    let stdout = owner.child.stdout.take();
+    let stderr = owner.child.stderr.take();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let stdout_cap_exceeded = AtomicBool::new(false);
+    let result = owner
+        .complete(
+            async {
+                let write_stdin = async {
+                    if let Some(mut pipe) = child_stdin.take() {
+                        pipe.write_all(stdin).await?;
+                    }
+                    Ok(())
+                };
+                tokio::try_join!(
+                    write_stdin,
+                    drain_or_kill_on_cap(
+                        stdout,
+                        &mut stdout_bytes,
+                        &mut stdout_truncated,
+                        stdout_cap,
+                        kill_on_stdout_cap,
+                        &stdout_cap_exceeded,
+                    ),
+                    drain(stderr, &mut stderr_bytes, &mut stderr_truncated, stderr_cap),
+                )?;
+                Ok(())
+            },
+            timeout,
+            cancel,
+        )
+        .await;
+    // The stdout drain's early return races `complete`'s own
+    // deadline/cancel branches (all three kill the child the same way);
+    // whichever one actually wins, the flag it set beforehand is the
+    // authoritative reason, so it always reports as `OutputTooLarge`
+    // rather than `Killed`/`Io`.
+    if stdout_cap_exceeded.load(Ordering::Relaxed) {
+        return Err(ProcessError::OutputTooLarge);
+    }
+    let status = result?;
+    Ok(CapturedOutput {
+        output: Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
 async fn drain<R: AsyncRead + Unpin>(
     reader: Option<R>,
     bytes: &mut Vec<u8>,
@@ -238,6 +349,41 @@ async fn drain<R: AsyncRead + Unpin>(
             let retained = count.min(cap.unwrap_or(usize::MAX).saturating_sub(bytes.len()));
             bytes.extend_from_slice(&chunk[..retained]);
             *truncated |= retained < count;
+        }
+    }
+    Ok(())
+}
+
+/// Like [`drain`], but when `kill_on_cap` is set, hitting the cap stops
+/// reading immediately — reporting it to the caller via `cap_exceeded`
+/// (set before this returns `Err`, so it is visible even though the
+/// `Err` itself gets folded into a generic `ProcessError` by
+/// `complete`'s own `?`) — instead of continuing to drain to EOF.
+async fn drain_or_kill_on_cap<R: AsyncRead + Unpin>(
+    reader: Option<R>,
+    bytes: &mut Vec<u8>,
+    truncated: &mut bool,
+    cap: Option<usize>,
+    kill_on_cap: bool,
+    cap_exceeded: &AtomicBool,
+) -> io::Result<()> {
+    if let Some(mut reader) = reader {
+        let mut chunk = vec![0; 8192];
+        loop {
+            let count = reader.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            let retained = count.min(cap.unwrap_or(usize::MAX).saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..retained]);
+            let over_cap = retained < count;
+            *truncated |= over_cap;
+            if over_cap && kill_on_cap {
+                cap_exceeded.store(true, Ordering::Relaxed);
+                return Err(io::Error::other(
+                    "stdout exceeded its cap; killing the child rather than draining to EOF",
+                ));
+            }
         }
     }
     Ok(())
@@ -276,5 +422,60 @@ mod tests {
         assert_eq!(error.to_string(), "process I/O failed");
         assert_eq!(format!("{error:?}"), "process I/O failed");
         assert!(!crate::process_exists(pid));
+    }
+
+    #[tokio::test]
+    async fn capture_with_stdin_opts_kills_a_child_that_writes_past_the_stdout_cap() {
+        // Render-url's Graphviz render opts into `kill_on_stdout_cap` so a
+        // bomb that never stops writing past the cap does not hold the
+        // shared render-permit semaphore until the kill timeout: hitting
+        // the cap must stop draining and kill the child immediately,
+        // well before the (generous, 30 s) deadline below.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("cat >/dev/null; yes x");
+        let started = std::time::Instant::now();
+        let result = capture_with_stdin_opts(
+            &mut command,
+            b"",
+            Some(Duration::from_secs(30)),
+            &CancellationToken::new(),
+            Some(1024),
+            Some(1024),
+            true,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("hitting the stdout cap should fail the capture");
+        };
+        assert!(matches!(error, ProcessError::OutputTooLarge), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_with_stdin_preserves_the_drain_to_eof_default() {
+        // Callers that do not opt in (e.g. `validation_runner`) keep
+        // draining to EOF and reporting `stdout_truncated` rather than
+        // failing outright, exactly like before `kill_on_stdout_cap`
+        // existed.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; head -c 5000 /dev/zero | tr '\\0' x");
+        let captured = capture_with_stdin(
+            &mut command,
+            b"",
+            Some(Duration::from_secs(5)),
+            &CancellationToken::new(),
+            Some(1024),
+            Some(1024),
+        )
+        .await
+        .expect("a finite child over the cap should still complete");
+        assert!(captured.stdout_truncated);
+        assert_eq!(captured.output.stdout.len(), 1024);
     }
 }

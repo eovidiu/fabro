@@ -1515,6 +1515,10 @@ pub(crate) enum Commands {
     /// Render a DOT graph to SVG (internal)
     #[command(name = "__render-graph", hide = true)]
     RenderGraph,
+    /// Validate a workflow's DOT source, within graph-size limits
+    /// (internal)
+    #[command(name = "__validate-workflow", hide = true)]
+    ValidateWorkflow,
     /// Build a panic event and write JSON to stdout (internal testing)
     #[cfg(debug_assertions)]
     #[command(name = "__test_panic", hide = true)]
@@ -1620,6 +1624,7 @@ impl Commands {
             Self::SendPanic { .. } => "__send_panic",
             Self::CliReference => "__cli-reference",
             Self::RenderGraph => "__render-graph",
+            Self::ValidateWorkflow => "__validate-workflow",
             #[cfg(debug_assertions)]
             Self::TestPanic { .. } => "__test_panic",
         }

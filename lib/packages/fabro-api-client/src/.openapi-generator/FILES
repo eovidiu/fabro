@@ -357,6 +357,8 @@ models/reasoning-output.ts
 models/related-workflow-diagnostic.ts
 models/render-workflow-graph-direction.ts
 models/render-workflow-graph-format.ts
+models/render-workflow-graph-from-url-request.ts
+models/render-workflow-graph-from-url-response.ts
 models/render-workflow-graph-request.ts
 models/replace-automation-request.ts
 models/replace-environment-request.ts

@@ -1528,6 +1528,117 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/v1/graph/render-url:
+    post:
+      operationId: renderWorkflowGraphFromUrl
+      tags: [Runs]
+      summary: Render Workflow Graph From URL
+      description: |
+        Loads a single raw `.fabro` workflow file from an https URL and
+        renders its graph as sanitized SVG, without creating a run. Files it
+        references (imports, child workflows, `@file` prompts or schemas)
+        are not fetched; unresolved references are reported as `notices`,
+        not errors. Only public https hosts and GitHub repositories the
+        server's GitHub credentials can read are reachable; loopback,
+        private, link-local and cloud-metadata addresses are refused.
+
+        The downloaded file is capped at 3 MiB. Before validating, the
+        parsed graph is checked against limits of 500 nodes, 2,000 edges,
+        20,000 statements, 3 MiB of attribute text (with `node []`/`edge
+        []` defaults applied), and at most 8 nested subgraphs (the
+        digraph's own body is not counted as a level); exceeding any of
+        them is refused as `graph_too_large` (413) with `meta.limit`,
+        `meta.count`, and `meta.max` (which dimension) before the
+        expensive validation pass runs. At most 2 validations run at
+        once; a request waits at most 5 s for a slot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenderWorkflowGraphFromUrlRequest"
+      responses:
+        "200":
+          description: Rendered graph with any reference notices and warnings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RenderWorkflowGraphFromUrlResponse"
+        "400":
+          description: >-
+            `invalid_url` (malformed URL or one carrying userinfo),
+            `scheme_not_https` (a non-https URL, or a redirect to one),
+            `host_not_allowed` (the URL's address is loopback, private,
+            link-local, cloud-metadata, or more than 3 redirects), or
+            `not_parsable` (non-UTF-8 or not a parsable workflow).
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: >-
+            `too_large` (the downloaded file exceeds 3 MiB) or
+            `graph_too_large` (the parsed graph exceeds the node, edge,
+            statement, attribute-text, or subgraph-nesting limit;
+            `meta.limit` names the exceeded dimension — `nodes`, `edges`,
+            `statements`, `attribute_text`, or `nesting_depth` (the number
+            of nested subgraphs) — `meta.count` is the value measured
+            when the check stopped (at least `meta.max + 1`, but not
+            necessarily the graph's true total for that dimension, since
+            the check stops at the first dimension it finds over its
+            limit), and `meta.max` is the allowed maximum).
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: "`validation_failed`, with `meta.diagnostics` as `WorkflowDiagnostic`-shaped objects."
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: "`unreachable` (connection failed) or `http_status` (with `meta.status`)."
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: >-
+            `render_failed`: no validation slot became available within 5 s
+            (at most 2 validations run at once), the validation subprocess
+            exceeded 1 GiB (Linux only) or 10 s, no render permit became
+            available within 5 s, or the render subprocess failed or
+            exceeded 10 s.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: "`timeout`: fetching the source URL exceeded the 10 s budget."
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/v1/runs/{id}:
     get:
       operationId: retrieveRun
@@ -10034,6 +10145,56 @@ components:
       enum:
         - lr
         - tb
+
+    RenderWorkflowGraphFromUrlRequest:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+          description: >-
+            An https URL to one raw `.fabro` workflow file (Graphviz DOT).
+            Loopback, private, link-local and cloud-metadata addresses are
+            refused.
+          example: "https://raw.githubusercontent.com/acme/workflows/main/.fabro/workflows/smoke/workflow.fabro"
+        direction:
+          $ref: "#/components/schemas/RenderWorkflowGraphDirection"
+
+    RenderWorkflowGraphFromUrlResponse:
+      type: object
+      required:
+        - svg
+        - notices
+        - warnings
+      properties:
+        svg:
+          type: string
+          description: Sanitized SVG markup for the workflow's graph.
+        notices:
+          type: array
+          description: >-
+            Diagnostics about files the workflow references but that were
+            not fetched (`@file` prompts or schemas, imports, child
+            workflows). These do not block rendering.
+          items:
+            $ref: "#/components/schemas/WorkflowDiagnostic"
+        warnings:
+          type: array
+          description: Non-blocking diagnostics from validating the workflow.
+          items:
+            $ref: "#/components/schemas/WorkflowDiagnostic"
+        direction:
+          allOf:
+            - $ref: "#/components/schemas/RenderWorkflowGraphDirection"
+          description: >-
+            The graph's effective layout direction: the request's own
+            `direction` when it sent one; otherwise the rendered source's
+            `rankdir` when it is `lr` or `tb` (case-insensitive); `tb`
+            when the source has no `rankdir` at all (Graphviz's own
+            default); omitted entirely when the source's `rankdir` is
+            `bt` or `rl`, which this field cannot represent.
 
     PreflightWorkflowSummary:
       type: object

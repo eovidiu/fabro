@@ -73,6 +73,8 @@ mod unarchive;
 mod uninstall;
 mod upgrade;
 mod validate;
+mod validate_workflow;
+mod validate_workflow_linux;
 mod variable;
 mod variable_get;
 mod variable_list;

@@ -104,28 +104,52 @@ pub struct TestAppStateBuilder {
     automation_materializer:      Option<TestAutomationRunMaterializer>,
     #[cfg(test)]
     worker_runtime:               Option<Arc<dyn WorkerRuntime>>,
+    #[cfg(test)]
+    graph_url_fetch_policy:       Option<crate::graph_url_fetch::FetchPolicy>,
+    #[cfg(test)]
+    graph_url_render_limits:      Option<(std::time::Duration, std::time::Duration)>,
+    #[cfg(test)]
+    graph_url_render_exe:         Option<std::path::PathBuf>,
+    #[cfg(test)]
+    graph_url_validation: Option<(
+        Option<std::path::PathBuf>,
+        std::time::Duration,
+        std::time::Duration,
+    )>,
+    #[cfg(test)]
+    graph_url_credential:         Option<(String, fabro_http::HeaderValue)>,
 }
 
 impl Default for TestAppStateBuilder {
     fn default() -> Self {
         Self {
-            server_settings:              default_test_server_settings(),
-            manifest_run_defaults:        RunLayer::default(),
-            max_concurrent_runs:          5,
-            execute_in_process:           false,
-            sandbox_inventory:            None,
-            store_bundle:                 None,
-            vault_path:                   None,
-            vault_entries:                Vec::new(),
-            server_env_path:              None,
-            active_config_path:           None,
-            server_secret_env:            HashMap::new(),
+            server_settings: default_test_server_settings(),
+            manifest_run_defaults: RunLayer::default(),
+            max_concurrent_runs: 5,
+            execute_in_process: false,
+            sandbox_inventory: None,
+            store_bundle: None,
+            vault_path: None,
+            vault_entries: Vec::new(),
+            server_env_path: None,
+            active_config_path: None,
+            server_secret_env: HashMap::new(),
             default_environment_provider: Some(SandboxProviderKind::DOCKER),
-            env_lookup:                   default_env_lookup(),
-            llm_overlay:                  LlmLayer::default(),
-            automation_materializer:      None,
+            env_lookup: default_env_lookup(),
+            llm_overlay: LlmLayer::default(),
+            automation_materializer: None,
             #[cfg(test)]
-            worker_runtime:               None,
+            worker_runtime: None,
+            #[cfg(test)]
+            graph_url_fetch_policy: None,
+            #[cfg(test)]
+            graph_url_render_limits: None,
+            #[cfg(test)]
+            graph_url_render_exe: None,
+            #[cfg(test)]
+            graph_url_validation: None,
+            #[cfg(test)]
+            graph_url_credential: None,
         }
     }
 }
@@ -191,6 +215,52 @@ impl TestAppStateBuilder {
     #[cfg(test)]
     pub(crate) fn worker_runtime(mut self, worker_runtime: Arc<dyn WorkerRuntime>) -> Self {
         self.worker_runtime = Some(worker_runtime);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_url_fetch_policy(
+        mut self,
+        policy: crate::graph_url_fetch::FetchPolicy,
+    ) -> Self {
+        self.graph_url_fetch_policy = Some(policy);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_url_render_limits(
+        mut self,
+        permit_wait: std::time::Duration,
+        kill_after: std::time::Duration,
+    ) -> Self {
+        self.graph_url_render_limits = Some((permit_wait, kill_after));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_url_render_exe(mut self, exe_override: std::path::PathBuf) -> Self {
+        self.graph_url_render_exe = Some(exe_override);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_url_validation(
+        mut self,
+        exe_override: Option<std::path::PathBuf>,
+        permit_wait: std::time::Duration,
+        kill_after: std::time::Duration,
+    ) -> Self {
+        self.graph_url_validation = Some((exe_override, permit_wait, kill_after));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_url_credential(
+        mut self,
+        host: impl Into<String>,
+        header_value: fabro_http::HeaderValue,
+    ) -> Self {
+        self.graph_url_credential = Some((host.into(), header_value));
         self
     }
 
@@ -313,6 +383,16 @@ impl TestAppStateBuilder {
             worker_control_bus: None,
             #[cfg(test)]
             worker_runtime: self.worker_runtime,
+            #[cfg(test)]
+            graph_url_fetch_policy_override: self.graph_url_fetch_policy,
+            #[cfg(test)]
+            graph_url_render_limits_override: self.graph_url_render_limits,
+            #[cfg(test)]
+            graph_url_render_exe_override: self.graph_url_render_exe,
+            #[cfg(test)]
+            graph_url_validation_override: self.graph_url_validation,
+            #[cfg(test)]
+            graph_url_credential_override: self.graph_url_credential,
             automation_materializer_override,
         })
     }

@@ -16,4 +16,5 @@ workspace = true
 anyhow.workspace = true
 fabro-dot = { path = "../fabro-dot" }
 graphviz-sys.workspace = true
+quick-xml = "0.38"
 regex = { workspace = true }

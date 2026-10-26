@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import useSWR, { type SWRConfiguration } from "swr";
+import useSWR, { useSWRConfig, type SWRConfiguration } from "swr";
 import type {
   ApiQuestion,
   AuthConfigResponse,
@@ -23,6 +23,8 @@ import type {
   PaginatedWorkflowListResponse,
   ProviderList,
   PullRequestResponse,
+  RenderWorkflowGraphDirection,
+  RenderWorkflowGraphFromUrlResponse,
   RunArtifactListResponse,
   RunProjection,
   Run,
@@ -259,6 +261,127 @@ export function useRunGraphSource(id: string | undefined, enabled: boolean) {
   return useSWR<string | null>(
     id && enabled ? queryKeys.runs.graphSource(id) : null,
     () => apiNullableData(() => runsApi.retrieveRunGraphSource(id!)),
+  );
+}
+
+export interface GraphRenderFromUrlData extends RenderWorkflowGraphFromUrlResponse {
+  /**
+   * The exact `url` this response was rendered from. `keepPreviousData`
+   * (below) returns the previous key's response whenever the current key
+   * has no cached data yet — including a key that failed, or no key at
+   * all (`url` cleared) — so callers must compare this against the
+   * current `url` before treating `data` as belonging to it; see
+   * VisualizeView in routes/visualize.tsx.
+   */
+  sourceUrl: string;
+  /**
+   * The exact `direction` this response was *requested* with (not the
+   * server-reported drawn direction, `direction` above). Captured in the
+   * fetcher's own closure at dispatch time, so it stays correct even if a
+   * slower request for a since-superseded direction settles after a
+   * newer one already replaced it — unlike reading the component's live
+   * `direction` state from an `onSuccess`/`onError` callback, which by
+   * then reflects whatever is current, not what that particular request
+   * asked for. Callers should derive "last good direction" from this
+   * field on the data actually being displayed, not from a callback.
+   */
+  requestedDirection: RenderWorkflowGraphDirection | undefined;
+}
+
+export function useGraphRenderFromUrl(
+  url: string | undefined,
+  direction: RenderWorkflowGraphDirection | undefined,
+) {
+  return useSWR<GraphRenderFromUrlData>(
+    url ? queryKeys.graph.renderUrl(url, direction === "lr" ? "LR" : direction === "tb" ? "TB" : undefined) : null,
+    async () => {
+      const response = await apiData(() => runsApi.renderWorkflowGraphFromUrl({ url: url!, direction }));
+      return { ...response, sourceUrl: url!, requestedDirection: direction };
+    },
+    // Keep the previous graph (and toolbar) mounted across a direction
+    // change instead of blanking the viewport for the length of the
+    // fetch/validate/render round trip. The caller may still choose to
+    // hide it anyway for a plain Load/resubmit — see `isLoading` in
+    // VisualizeView's `dataForUrl` — since `isLoading` (unlike `data`)
+    // isn't masked by `keepPreviousData` below: it stays true while the
+    // active key has no real data of its own yet. `sourceUrl`/
+    // `requestedDirection` above are what let the caller tell which key a
+    // given `data` actually belongs to, instead of trusting a callback
+    // that may fire after that key stopped being current.
+    // `revalidateIfStale: false` keeps switching back to an
+    // already-rendered key (a direction toggled back, or a direction
+    // reverted after a failed re-request) from silently re-fetching data
+    // that's already cached; an explicit Load forces a real fetch instead
+    // by clearing that url's cache (and SWR's own dedupe entry for it)
+    // first — see `useInvalidateGraphRenderFromUrl`.
+    {
+      keepPreviousData:  true,
+      revalidateIfStale: false,
+    },
+  );
+}
+
+/**
+ * Clears every cached `graph/render-url` response for `url` (every
+ * direction key) and revalidates it: an explicit Load uses this so it
+ * always hits the network — even for a url whose response is still
+ * cached from earlier this session (`A -> B -> A`), and even a resubmit
+ * of the url already showing — instead of `revalidateIfStale: false`
+ * above silently reusing a stale cache entry, or SWR's own
+ * `dedupingInterval` folding a resubmit within it into whatever request
+ * is still being deduped for that key. `{ revalidate: true }` deletes
+ * that per-key dedupe entry (see SWR's `internalMutate`/
+ * `startRevalidate`) before revalidating, and also drives the
+ * revalidation itself — so this is the only trigger a same-url
+ * resubmit's currently-mounted key needs; the caller doesn't need its
+ * own extra `mutate()` for that case. Clearing the cache's `data` (not
+ * just its `error`) first is what makes the ensuing request count as
+ * `isLoading`, not only `isValidating` — see `isPlainLoadPending` in
+ * VisualizeView — so the previous graph stays hidden for the whole
+ * fetch, not only once it settles; a failure then keeps it hidden
+ * afterwards too, via `dataForUrl`'s `!error` term there, instead of
+ * leaving the previous good response up behind the error. Uses the
+ * *bound* `mutate` from `useSWRConfig` (not the top-level `mutate`
+ * export) so it targets whichever cache provider is actually in scope —
+ * the default one in the app, or a test's isolated one.
+ */
+export function useInvalidateGraphRenderFromUrl() {
+  const { mutate } = useSWRConfig();
+  return useCallback(
+    (url: string) => {
+      void mutate(
+        (key: unknown) =>
+          Array.isArray(key) && key[0] === "graph" && key[1] === "render-url" && key[2] === url,
+        undefined,
+        { revalidate: true },
+      );
+    },
+    [mutate],
+  );
+}
+
+/**
+ * Clears one exact `graph/render-url` cache entry's `error` (its `data`
+ * is already undefined for a key that only ever failed) without fetching
+ * anything — the single-key counterpart of `useInvalidateGraphRenderFromUrl`
+ * above, which clears every direction of a url at once for an explicit
+ * Load. Used right before retrying a direction that just failed: SWR
+ * never clears `error` just because a new request started (only
+ * `isValidating`/`isLoading` — see `useGraphRenderFromUrl`), so without
+ * this the retry would still read as failed — and so would anything
+ * derived straight from it, like the caller's main error banner — for
+ * the length of the retry, not just if it fails again. Scoped to one key
+ * (not a filter, unlike `useInvalidateGraphRenderFromUrl`) so it never
+ * touches a *different* direction's own cached response, e.g. the one
+ * it's reverting from.
+ */
+export function useClearGraphRenderError() {
+  const { mutate } = useSWRConfig();
+  return useCallback(
+    (url: string, direction: "LR" | "TB" | undefined) => {
+      void mutate(queryKeys.graph.renderUrl(url, direction), undefined, { revalidate: false });
+    },
+    [mutate],
   );
 }
 

@@ -36,3 +36,25 @@ pub fn pre_exec_pdeathsig(cmd: &mut impl CommandExt) {
         });
     }
 }
+
+/// Register a `pre_exec` hook that calls `setrlimit(RLIMIT_AS, ...)` to cap
+/// the child's total virtual address space at `bytes`, both soft and hard.
+/// Linux-only: this is how the workflow-validation subprocess (see
+/// `fabro-server::validation_runner`) bounds memory, since macOS's
+/// `ulimit -v`/`RLIMIT_AS` does not actually cap process memory there.
+#[cfg(target_os = "linux")]
+pub fn pre_exec_rlimit_as(cmd: &mut impl CommandExt, bytes: u64) {
+    // SAFETY: setrlimit() is async-signal-safe per POSIX.
+    unsafe {
+        cmd.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: bytes as libc::rlim_t,
+                rlim_max: bytes as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &raw const limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}

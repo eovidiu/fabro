@@ -19,12 +19,15 @@
 //! Graphviz without a parser of its own.
 
 mod graphviz;
+pub mod limits;
 
 use std::fmt;
 
 use fabro_template::{StaticReferenceError, validate_static_reference};
 use fabro_types::ReferenceKind;
-pub use graphviz::normalize_for_graphviz;
+pub use graphviz::{
+    last_root_rankdir, normalize_for_graphviz, render_url_source, with_root_rankdir,
+};
 use petri_frontend_attractor::dot;
 use petri_frontend_attractor::model::{self, AttrValue, NodeDecl, Workflow};
 

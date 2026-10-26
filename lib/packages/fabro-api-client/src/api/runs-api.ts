@@ -62,6 +62,10 @@ import type { PullRequestLink } from '../models';
 // @ts-ignore
 import type { PullRequestResponse } from '../models';
 // @ts-ignore
+import type { RenderWorkflowGraphFromUrlRequest } from '../models';
+// @ts-ignore
+import type { RenderWorkflowGraphFromUrlResponse } from '../models';
+// @ts-ignore
 import type { RenderWorkflowGraphRequest } from '../models';
 // @ts-ignore
 import type { RewindRequest } from '../models';
@@ -996,6 +1000,47 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             };
         },
         /**
+         * Loads a single raw `.fabro` workflow file from an https URL and renders its graph as sanitized SVG, without creating a run. Files it references (imports, child workflows, `@file` prompts or schemas) are not fetched; unresolved references are reported as `notices`, not errors. Only public https hosts and GitHub repositories the server\'s GitHub credentials can read are reachable; loopback, private, link-local and cloud-metadata addresses are refused.  The downloaded file is capped at 3 MiB. Before validating, the parsed graph is checked against limits of 500 nodes, 2,000 edges, 20,000 statements, 3 MiB of attribute text (with `node []`/`edge []` defaults applied), and at most 8 nested subgraphs (the digraph\'s own body is not counted as a level); exceeding any of them is refused as `graph_too_large` (413) with `meta.limit`, `meta.count`, and `meta.max` (which dimension) before the expensive validation pass runs. At most 2 validations run at once; a request waits at most 5 s for a slot.
+         * @summary Render Workflow Graph From URL
+         * @param {RenderWorkflowGraphFromUrlRequest} renderWorkflowGraphFromUrlRequest
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        renderWorkflowGraphFromUrl: async (renderWorkflowGraphFromUrlRequest: RenderWorkflowGraphFromUrlRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'renderWorkflowGraphFromUrlRequest' is not null or undefined
+            assertParamExists('renderWorkflowGraphFromUrl', 'renderWorkflowGraphFromUrlRequest', renderWorkflowGraphFromUrlRequest)
+            const localVarPath = `/api/v1/graph/render-url`;
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(renderWorkflowGraphFromUrlRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
          * Resolves a run selector to one durable run summary using server-owned selector semantics.
          * @summary Resolve Run Selector
          * @param {string} selector Run selector, such as a run ID prefix, workflow slug, or workflow name.
@@ -1872,6 +1917,19 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
+         * Loads a single raw `.fabro` workflow file from an https URL and renders its graph as sanitized SVG, without creating a run. Files it references (imports, child workflows, `@file` prompts or schemas) are not fetched; unresolved references are reported as `notices`, not errors. Only public https hosts and GitHub repositories the server\'s GitHub credentials can read are reachable; loopback, private, link-local and cloud-metadata addresses are refused.  The downloaded file is capped at 3 MiB. Before validating, the parsed graph is checked against limits of 500 nodes, 2,000 edges, 20,000 statements, 3 MiB of attribute text (with `node []`/`edge []` defaults applied), and at most 8 nested subgraphs (the digraph\'s own body is not counted as a level); exceeding any of them is refused as `graph_too_large` (413) with `meta.limit`, `meta.count`, and `meta.max` (which dimension) before the expensive validation pass runs. At most 2 validations run at once; a request waits at most 5 s for a slot.
+         * @summary Render Workflow Graph From URL
+         * @param {RenderWorkflowGraphFromUrlRequest} renderWorkflowGraphFromUrlRequest
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest: RenderWorkflowGraphFromUrlRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<RenderWorkflowGraphFromUrlResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['RunsApi.renderWorkflowGraphFromUrl']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
          * Resolves a run selector to one durable run summary using server-owned selector semantics.
          * @summary Resolve Run Selector
          * @param {string} selector Run selector, such as a run ID prefix, workflow slug, or workflow name.
@@ -2290,6 +2348,16 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.renderWorkflowGraph(renderWorkflowGraphRequest, options).then((request) => request(axios, basePath));
         },
         /**
+         * Loads a single raw `.fabro` workflow file from an https URL and renders its graph as sanitized SVG, without creating a run. Files it references (imports, child workflows, `@file` prompts or schemas) are not fetched; unresolved references are reported as `notices`, not errors. Only public https hosts and GitHub repositories the server\'s GitHub credentials can read are reachable; loopback, private, link-local and cloud-metadata addresses are refused.  The downloaded file is capped at 3 MiB. Before validating, the parsed graph is checked against limits of 500 nodes, 2,000 edges, 20,000 statements, 3 MiB of attribute text (with `node []`/`edge []` defaults applied), and at most 8 nested subgraphs (the digraph\'s own body is not counted as a level); exceeding any of them is refused as `graph_too_large` (413) with `meta.limit`, `meta.count`, and `meta.max` (which dimension) before the expensive validation pass runs. At most 2 validations run at once; a request waits at most 5 s for a slot.
+         * @summary Render Workflow Graph From URL
+         * @param {RenderWorkflowGraphFromUrlRequest} renderWorkflowGraphFromUrlRequest
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest: RenderWorkflowGraphFromUrlRequest, options?: RawAxiosRequestConfig): AxiosPromise<RenderWorkflowGraphFromUrlResponse> {
+            return localVarFp.renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest, options).then((request) => request(axios, basePath));
+        },
+        /**
          * Resolves a run selector to one durable run summary using server-owned selector semantics.
          * @summary Resolve Run Selector
          * @param {string} selector Run selector, such as a run ID prefix, workflow slug, or workflow name.
@@ -2682,6 +2750,17 @@ export class RunsApi extends BaseAPI {
      */
     public renderWorkflowGraph(renderWorkflowGraphRequest: RenderWorkflowGraphRequest, options?: RawAxiosRequestConfig) {
         return RunsApiFp(this.configuration).renderWorkflowGraph(renderWorkflowGraphRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Loads a single raw `.fabro` workflow file from an https URL and renders its graph as sanitized SVG, without creating a run. Files it references (imports, child workflows, `@file` prompts or schemas) are not fetched; unresolved references are reported as `notices`, not errors. Only public https hosts and GitHub repositories the server\'s GitHub credentials can read are reachable; loopback, private, link-local and cloud-metadata addresses are refused.  The downloaded file is capped at 3 MiB. Before validating, the parsed graph is checked against limits of 500 nodes, 2,000 edges, 20,000 statements, 3 MiB of attribute text (with `node []`/`edge []` defaults applied), and at most 8 nested subgraphs (the digraph\'s own body is not counted as a level); exceeding any of them is refused as `graph_too_large` (413) with `meta.limit`, `meta.count`, and `meta.max` (which dimension) before the expensive validation pass runs. At most 2 validations run at once; a request waits at most 5 s for a slot.
+     * @summary Render Workflow Graph From URL
+     * @param {RenderWorkflowGraphFromUrlRequest} renderWorkflowGraphFromUrlRequest
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest: RenderWorkflowGraphFromUrlRequest, options?: RawAxiosRequestConfig) {
+        return RunsApiFp(this.configuration).renderWorkflowGraphFromUrl(renderWorkflowGraphFromUrlRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

@@ -505,6 +505,13 @@ async fn run_git_plan(plan: GitCommandPlan) -> Result<Vec<u8>, GitCommandError> 
             command: safe_command_label(&plan),
             source:  std::io::Error::new(std::io::ErrorKind::Interrupted, err),
         },
+        // Unreachable: this caller uses `capture`, never
+        // `capture_with_stdin_opts`'s `kill_on_stdout_cap`, which is the
+        // only path that ever constructs this variant.
+        ProcessError::OutputTooLarge => GitCommandError::Spawn {
+            command: safe_command_label(&plan),
+            source:  std::io::Error::other(err),
+        },
     })?
     .output;
 

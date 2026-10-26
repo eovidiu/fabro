@@ -13,6 +13,7 @@ mod completions;
 mod environments;
 pub(in crate::server) mod events;
 pub(in crate::server) mod graph;
+mod graph_url;
 pub(in crate::server) mod lifecycle;
 mod lineage;
 mod llm_sse;
@@ -220,6 +221,7 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .merge(petri::routes())
         .merge(graph::manifest_routes())
         .merge(graph::run_routes())
+        .merge(graph_url::routes())
         .merge(models::routes())
         .merge(secrets::routes())
         .merge(variables::routes())
